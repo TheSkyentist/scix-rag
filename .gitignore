@@ -1,0 +1,12 @@
+.env
+.pixi/
+__pycache__/
+*.pyc
+
+# Ephemeral fetch/convert caches -- regenerated fresh each run from
+# papers.duckdb's pending status columns, not meant to persist.
+data/html/
+data/markdown/
+data/pdf/
+
+# papers.duckdb IS meant to be committed -- do not ignore it.
