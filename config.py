@@ -31,6 +31,8 @@ ARCANA_NAME = os.environ.get('ARCANA_NAME')
 ARCANA_BASE_URL = 'https://chat-ai.academiccloud.de/v1/arcanas/api/v1'
 ARCANA_MAX_FILE_BYTES = 300 * 1024 * 1024  # documented per-file hard cap
 
+ARCANA_INDEX_BATCH_SIZE = 500
+
 MAX_CHUNK_TOKENS = 1024
 ADS_PAGE_SIZE = 200
 ADS_BATCH_SIZE = 75  # bibcodes per OR'd batch-fetch query
