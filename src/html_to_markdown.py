@@ -41,6 +41,33 @@ def _is_section(el: Tag) -> bool:
     return el.name == "section" and bool(_SECTION_CLASSES & set(el.get("class") or []))
 
 
+def _is_renderable_leaf(el: Tag) -> bool:
+    if _is_section(el):
+        return True
+    if el.name in ("figure", "table"):
+        return True
+    return el.name == "div" and "ltx_para" in (el.get("class") or [])
+
+
+def _iter_content_blocks(el: Tag, skip_ids: set[int]) -> list[Tag]:
+    """Depth-first collection of renderable content (sections, paragraphs,
+    figures, tables), transparently descending into generic grouping
+    elements (e.g. LaTeXML's `ltx_logical-block` wrapper div) that carry no
+    semantic meaning of their own -- some documents put body content
+    directly under one of these instead of under `<section>` tags."""
+    blocks: list[Tag] = []
+    for child in el.find_all(recursive=False):
+        if not isinstance(child, Tag) or id(child) in skip_ids:
+            continue
+        if _is_section(child) and "ltx_bibliography" in (child.get("class") or []):
+            continue
+        if _is_renderable_leaf(child):
+            blocks.append(child)
+        else:
+            blocks.extend(_iter_content_blocks(child, skip_ids))
+    return blocks
+
+
 def _render_table(table: Tag) -> str:
     rows = []
     for tr in table.find_all("tr"):
@@ -137,9 +164,10 @@ def convert(html: str) -> str:
         if text:
             blocks.append(f"**Keywords:** {text}")
 
-    for sec in article.find_all("section", recursive=False):
-        if "ltx_bibliography" in (sec.get("class") or []):
-            continue  # citation graph lives in papers.duckdb, not embedded text
-        blocks.extend(_render_block(sec, depth=1))
+    authors = article.find("div", class_="ltx_authors")
+    skip_ids = {id(t) for t in (title_tag, abstract, keywords, authors) if t is not None}
+
+    for block_el in _iter_content_blocks(article, skip_ids):
+        blocks.extend(_render_block(block_el, depth=1))
 
     return "\n\n".join(b for b in blocks if b)
