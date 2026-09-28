@@ -29,7 +29,7 @@ import httpx
 
 import config
 
-_ARXIV_ID_RE = re.compile(r"arXiv:(\d{4}\.\d{4,5}|\d{7})", re.IGNORECASE)
+_ARXIV_ID_RE = re.compile(r'arXiv:(\d{4}\.\d{4,5}|\d{7})', re.IGNORECASE)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -63,17 +63,34 @@ CREATE TABLE IF NOT EXISTS citation_edges (
 """
 
 _PAPER_COLUMNS = [
-    "bibcode", "alternate_bibcode", "arxiv_id", "title", "author", "first_author",
-    "abstract", "year", "pubdate", "doctype", "pub", "volume", "page", "doi",
-    "keyword", "arxiv_class", "citation_count", "property", "query_source", "added_at",
+    'bibcode',
+    'alternate_bibcode',
+    'arxiv_id',
+    'title',
+    'author',
+    'first_author',
+    'abstract',
+    'year',
+    'pubdate',
+    'doctype',
+    'pub',
+    'volume',
+    'page',
+    'doi',
+    'keyword',
+    'arxiv_class',
+    'citation_count',
+    'property',
+    'query_source',
+    'added_at',
 ]
 
-# Named column list, not bare VALUES(...): other modules ALTER TABLE to add
-# their own status columns (html_status, md_status, ...), so a positional
-# insert against "all columns" breaks the moment the table grows.
+# Named column list, not bare VALUES(...): fetch.py ALTER TABLEs in its own
+# `esources` column, so a positional insert against "all columns" breaks
+# the moment the table grows.
 _UPSERT_PAPERS = f"""
-INSERT INTO papers ({", ".join(_PAPER_COLUMNS)})
-VALUES ({", ".join(["?"] * len(_PAPER_COLUMNS))})
+INSERT INTO papers ({', '.join(_PAPER_COLUMNS)})
+VALUES ({', '.join(['?'] * len(_PAPER_COLUMNS))})
 ON CONFLICT (bibcode) DO UPDATE SET
     alternate_bibcode = excluded.alternate_bibcode,
     arxiv_id          = excluded.arxiv_id,
@@ -102,18 +119,17 @@ ON CONFLICT (citing_bibcode, cited_bibcode) DO NOTHING
 
 def _session() -> httpx.Client:
     return httpx.Client(
-        headers={"Authorization": f"Bearer {config.ADS_API_KEY}"},
-        timeout=30,
+        headers={'Authorization': f'Bearer {config.ADS_API_KEY}'}, timeout=30
     )
 
 
 def _search(client: httpx.Client, q: str, rows: int) -> list[dict]:
     resp = client.get(
-        f"{config.ADS_BASE_URL}/search/query",
-        params={"q": q, "fl": config.ADS_FIELDS, "rows": rows},
+        f'{config.ADS_BASE_URL}/search/query',
+        params={'q': q, 'fl': config.ADS_FIELDS, 'rows': rows},
     )
     resp.raise_for_status()
-    return resp.json()["response"]["docs"]
+    return resp.json()['response']['docs']
 
 
 def _fetch_by_bibcode(client: httpx.Client, bibcode: str) -> dict | None:
@@ -126,7 +142,7 @@ def _fetch_many_by_bibcode(client: httpx.Client, bibcodes: list[str]) -> list[di
     docs: list[dict] = []
     for i in range(0, len(bibcodes), config.ADS_BATCH_SIZE):
         chunk = bibcodes[i : i + config.ADS_BATCH_SIZE]
-        q = "bibcode:(" + " OR ".join(f'"{b}"' for b in chunk) + ")"
+        q = 'bibcode:(' + ' OR '.join(f'"{b}"' for b in chunk) + ')'
         docs.extend(_search(client, q, rows=len(chunk)))
         time.sleep(config.ADS_DELAY)
     return docs
@@ -143,26 +159,26 @@ def _extract_arxiv_id(identifiers: list[str] | None) -> str | None:
 
 
 def _doc_to_params(d: dict, query_source: str) -> tuple:
-    year = d.get("year")
+    year = d.get('year')
     return (
-        d.get("bibcode"),
-        d.get("alternate_bibcode") or [],
-        _extract_arxiv_id(d.get("identifier")),
-        (d.get("title") or [None])[0],
-        d.get("author") or [],
-        d.get("first_author"),
-        d.get("abstract"),
+        d.get('bibcode'),
+        d.get('alternate_bibcode') or [],
+        _extract_arxiv_id(d.get('identifier')),
+        (d.get('title') or [None])[0],
+        d.get('author') or [],
+        d.get('first_author'),
+        d.get('abstract'),
         int(year) if year else None,
-        d.get("pubdate"),
-        d.get("doctype"),
-        d.get("pub"),
-        d.get("volume"),
-        d.get("page") or [],
-        d.get("doi") or [],
-        d.get("keyword") or [],
-        d.get("arxiv_class") or [],
-        d.get("citation_count"),
-        d.get("property") or [],
+        d.get('pubdate'),
+        d.get('doctype'),
+        d.get('pub'),
+        d.get('volume'),
+        d.get('page') or [],
+        d.get('doi') or [],
+        d.get('keyword') or [],
+        d.get('arxiv_class') or [],
+        d.get('citation_count'),
+        d.get('property') or [],
         query_source,
         datetime.now(timezone.utc).isoformat(),
     )
@@ -173,38 +189,40 @@ def build_test_corpus(seed_bibcode: str) -> None:
     con.execute(_SCHEMA)
 
     with _session() as client:
-        print(f"Fetching seed paper: {seed_bibcode}")
+        print(f'Fetching seed paper: {seed_bibcode}')
         seed = _fetch_by_bibcode(client, seed_bibcode)
         if seed is None:
-            print(f"  [error] no ADS record found for bibcode {seed_bibcode!r}")
+            print(f'  [error] no ADS record found for bibcode {seed_bibcode!r}')
             return
 
-        references = seed.get("reference") or []
-        citations = seed.get("citation") or []
-        print(f"  → {len(references)} references, {len(citations)} citations")
+        references = seed.get('reference') or []
+        citations = seed.get('citation') or []
+        print(f'  → {len(references)} references, {len(citations)} citations')
 
-        print(f"Fetching metadata for {len(references)} referenced papers...")
+        print(f'Fetching metadata for {len(references)} referenced papers...')
         ref_docs = _fetch_many_by_bibcode(client, references)
-        print(f"  → got {len(ref_docs)} records")
+        print(f'  → got {len(ref_docs)} records')
 
-        print(f"Fetching metadata for {len(citations)} citing papers...")
+        print(f'Fetching metadata for {len(citations)} citing papers...')
         cite_docs = _fetch_many_by_bibcode(client, citations)
-        print(f"  → got {len(cite_docs)} records")
+        print(f'  → got {len(cite_docs)} records')
 
-    rows = [_doc_to_params(seed, "seed")]
-    rows += [_doc_to_params(d, f"reference_of:{seed_bibcode}") for d in ref_docs]
-    rows += [_doc_to_params(d, f"citation_of:{seed_bibcode}") for d in cite_docs]
+    rows = [_doc_to_params(seed, 'seed')]
+    rows += [_doc_to_params(d, f'reference_of:{seed_bibcode}') for d in ref_docs]
+    rows += [_doc_to_params(d, f'citation_of:{seed_bibcode}') for d in cite_docs]
 
     con.executemany(_UPSERT_PAPERS, rows)
 
     edges = [(seed_bibcode, r) for r in references]  # seed cites r
-    edges += [(c, seed_bibcode) for c in citations]   # c cites seed
+    edges += [(c, seed_bibcode) for c in citations]  # c cites seed
     con.executemany(_INSERT_EDGE, edges)
     con.commit()
 
-    n_papers = con.execute("SELECT count(*) FROM papers").fetchone()[0]
-    n_edges = con.execute("SELECT count(*) FROM citation_edges").fetchone()[0]
-    print(f"\nDone. papers={n_papers} (total in DB), citation_edges={n_edges} → {config.DB_PATH}")
+    n_papers = con.execute('SELECT count(*) FROM papers').fetchone()[0]
+    n_edges = con.execute('SELECT count(*) FROM citation_edges').fetchone()[0]
+    print(
+        f'\nDone. papers={n_papers} (total in DB), citation_edges={n_edges} → {config.DB_PATH}'
+    )
     con.close()
 
 
@@ -234,58 +252,78 @@ def build_corpus_from_search(
     con = duckdb.connect(str(config.DB_PATH))
     con.execute(_SCHEMA)
 
-    known_bibcodes = {r[0] for r in con.execute("SELECT bibcode FROM papers").fetchall()}
+    known_bibcodes = {
+        r[0] for r in con.execute('SELECT bibcode FROM papers').fetchall()
+    }
 
     with _session() as client:
-        print(f"Searching: {query!r}")
+        print(f'Searching: {query!r}')
         seeds = _search(client, query, rows=max_seeds)
-        print(f"  → {len(seeds)} seed papers")
+        print(f'  → {len(seeds)} seed papers')
 
-        seed_bibcodes = {d["bibcode"] for d in seeds if d.get("bibcode")}
+        seed_bibcodes = {d['bibcode'] for d in seeds if d.get('bibcode')}
 
         neighbor_bibcodes: set[str] = set()
         edges: list[tuple[str, str]] = []
         for d in seeds:
-            bib = d.get("bibcode")
+            bib = d.get('bibcode')
             if not bib:
                 continue
-            refs = (d.get("reference") or []) if pull_references else []
-            cites = (d.get("citation") or []) if pull_citations else []
+            refs = (d.get('reference') or []) if pull_references else []
+            cites = (d.get('citation') or []) if pull_citations else []
             neighbor_bibcodes.update(refs)
             neighbor_bibcodes.update(cites)
-            edges += [(bib, r) for r in refs]   # seed cites r
+            edges += [(bib, r) for r in refs]  # seed cites r
             edges += [(c, bib) for c in cites]  # c cites seed
 
         already_have = known_bibcodes | seed_bibcodes
         to_fetch = sorted(neighbor_bibcodes - already_have)
-        print(f"  → {len(neighbor_bibcodes)} distinct referenced/citing bibcodes "
-              f"({len(to_fetch)} new, {len(neighbor_bibcodes) - len(to_fetch)} already in the database)")
+        print(
+            f'  → {len(neighbor_bibcodes)} distinct referenced/citing bibcodes '
+            f'({len(to_fetch)} new, {len(neighbor_bibcodes) - len(to_fetch)} already in the database)'
+        )
 
-        print(f"Fetching metadata for {len(to_fetch)} neighbor papers...")
+        print(f'Fetching metadata for {len(to_fetch)} neighbor papers...')
         neighbor_docs = _fetch_many_by_bibcode(client, to_fetch)
-        print(f"  → got {len(neighbor_docs)} records")
+        print(f'  → got {len(neighbor_docs)} records')
 
-    rows = [_doc_to_params(d, f"search:{query}") for d in seeds]
-    rows += [_doc_to_params(d, f"expansion_of_search:{query}") for d in neighbor_docs]
+    rows = [_doc_to_params(d, f'search:{query}') for d in seeds]
+    rows += [_doc_to_params(d, f'expansion_of_search:{query}') for d in neighbor_docs]
 
     con.executemany(_UPSERT_PAPERS, rows)
     con.executemany(_INSERT_EDGE, edges)
     con.commit()
 
-    n_papers = con.execute("SELECT count(*) FROM papers").fetchone()[0]
-    n_edges = con.execute("SELECT count(*) FROM citation_edges").fetchone()[0]
-    print(f"\nDone. papers={n_papers} (total in DB), citation_edges={n_edges} → {config.DB_PATH}")
+    n_papers = con.execute('SELECT count(*) FROM papers').fetchone()[0]
+    n_edges = con.execute('SELECT count(*) FROM citation_edges').fetchone()[0]
+    print(
+        f'\nDone. papers={n_papers} (total in DB), citation_edges={n_edges} → {config.DB_PATH}'
+    )
     con.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description="Build a citation-graph corpus from ADS")
-    parser.add_argument("--bibcode", help='Single seed bibcode, e.g. "2025A&A...702A..57H"')
-    parser.add_argument("--query", help='ADS query for many seeds, e.g. \'abs:"Little Red Dots"\'')
-    parser.add_argument("--no-references", action="store_true", help="With --query, skip pulling references (citations only)")
-    parser.add_argument("--no-citations", action="store_true", help="With --query, skip pulling citations (references only)")
+    parser = argparse.ArgumentParser(
+        description='Build a citation-graph corpus from ADS'
+    )
+    parser.add_argument(
+        '--bibcode', help='Single seed bibcode, e.g. "2025A&A...702A..57H"'
+    )
+    parser.add_argument(
+        '--query', help='ADS query for many seeds, e.g. \'abs:"Little Red Dot"\''
+    )
+    parser.add_argument(
+        '--no-references',
+        action='store_true',
+        help='With --query, skip pulling references (citations only)',
+    )
+    parser.add_argument(
+        '--no-citations',
+        action='store_true',
+        help='With --query, skip pulling citations (references only)',
+    )
     args = parser.parse_args()
 
     if args.bibcode:
@@ -297,4 +335,4 @@ if __name__ == "__main__":
             pull_citations=not args.no_citations,
         )
     else:
-        parser.error("pass --bibcode or --query")
+        parser.error('pass --bibcode or --query')

@@ -21,26 +21,22 @@ ADS_BASE_URL = 'https://api.adsabs.harvard.edu/v1'
 ADS_FIELDS = (
     'bibcode,alternate_bibcode,identifier,title,author,first_author,'
     'abstract,year,pubdate,doctype,pub,volume,page,doi,keyword,'
-    'arxiv_class,citation_count,reference,citation,property'
+    'arxiv_class,citation_count,reference,citation,property,esources'
 )
-
-# Not needed until we start uploading to Arcana; left optional so config
-# stays importable with only ADS_API_KEY set. Env var name(s) TBD.
-ARCANA_TOKEN = os.environ.get('SAIA_API_KEY')
-ARCANA_NAME = os.environ.get('ARCANA_NAME')
-ARCANA_BASE_URL = 'https://chat-ai.academiccloud.de/v1/arcanas/api/v1'
-ARCANA_MAX_FILE_BYTES = 300 * 1024 * 1024  # documented per-file hard cap
-
-ARCANA_INDEX_BATCH_SIZE = 500
 
 MAX_CHUNK_TOKENS = 1024
 ADS_PAGE_SIZE = 200
 ADS_BATCH_SIZE = 75  # bibcodes per OR'd batch-fetch query
 ADS_DELAY = 0.5  # seconds between ADS requests
-ARXIV_DELAY = 3.0  # seconds between arXiv HTML fetches
+ARXIV_DELAY = 1.0  # seconds between arXiv HTML fetches
 
-PAPERS_PATH = (
-    DATA_DIR / 'papers.parquet'
-)  # legacy, used by fetch_html/chunk/arcana_ingest for now
-CHUNKS_PATH = DATA_DIR / 'chunks.parquet'  # legacy, ditto
+# Below this, treat a conversion (HTML or PDF path) as empty/failed.
+# Calibrated against the corpus: smallest genuine converted paper so far
+# is ~1900 chars; ar5iv's own "conversion had a fatal error" placeholder
+# still contains an (empty) <article class="ltx_document"> plus a stray
+# error <div>, so a naive "ltx_document in html" check isn't enough --
+# validate by actually running the real converter and checking it
+# produced substance.
+MIN_MARKDOWN_CHARS = 500
+
 DB_PATH = DATA_DIR / 'papers.duckdb'
