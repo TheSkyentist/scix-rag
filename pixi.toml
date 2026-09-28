@@ -1,22 +1,53 @@
 [workspace]
 name = "arxivrag"
 version = "0.1.0"
-description = "Astronomical paper RAG pipeline using ADS/SciX and GWDG Arcana"
+description = "Local astronomical paper RAG pipeline (ADS/SciX corpus, self-hosted embedding + retrieval)"
 channels = ["conda-forge"]
-platforms = ["osx-arm64", "linux-64"]
+platforms = [{platform = "osx-arm64", macos = "14.5"}]
 
 [dependencies]
-python = ">=3.14.4,<3.15"
-polars = ">=1.40.1,<2"
-duckdb = ">=1.5.2,<2"
-marimo = ">=0.23.5,<0.24"
-beautifulsoup4 = ">=4.14.3,<5"
-lxml = ">=6.1.0,<7"
-httpx = ">=0.28.1,<0.29"
-python-dotenv = ">=1.2.2,<2"
-tiktoken = ">=0.12.0,<0.13"
+python = ">=3.14.7,<3.15"
+duckdb = ">=1.5.5,<2"
+python-dotenv = ">=1.2.3,<2"
 
-[tasks]
+[feature.query.dependencies]
+httpx = ">=0.28.1,<0.29"
+
+[feature.query.tasks]
 query = "python -m src.ads_query"
-fetch-convert = "python -m src.fetch_convert"
-arcana-upload = "python -m src.arcana_upload"
+
+[feature.fetch.dependencies]
+httpx = ">=0.28.1,<0.29"
+beautifulsoup4 = ">=4.15.0,<5"
+lxml = ">=6.1.3,<7"
+
+[feature.fetch.tasks]
+fetch = "python -m src.fetch"
+
+[feature.extract.dependencies]
+beautifulsoup4 = ">=4.15.0,<5"
+lxml = ">=6.1.3,<7"
+
+[feature.extract.pypi-dependencies]
+mineru = { version = ">=4.0.7, <5", extras = ["torch"] }
+opencv-python-headless = ">=5.0.0.93, <6"
+
+[feature.extract.tasks]
+convert = "python -m src.convert"
+
+[feature.chunk.dependencies]
+transformers = ">=4.57,<5"
+
+[feature.chunk.tasks]
+chunk = "python -m src.chunk"
+
+[feature.embed.dependencies]
+mlx = ">=0.32.0,<0.33"
+mlx-lm = ">=0.31.3,<0.32"
+
+[environments]
+query = { features = ["query"] }
+fetch = { features = ["fetch"] }
+extract = { features = ["extract"] }
+chunk = { features = ["chunk"] }
+embed = { features = ["embed"] }
