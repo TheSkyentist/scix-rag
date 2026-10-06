@@ -11,6 +11,10 @@ HTML_DIR = DATA_DIR / 'html'
 MARKDOWN_DIR = DATA_DIR / 'markdown'
 PDF_DIR = DATA_DIR / 'pdf'
 
+# Hand-maintained list of raw filenames the bulk `convert` skips. Lives at
+# the repo root (not under data/) so it's committed, unlike data/pdf/.
+CONVERT_IGNORE_PATH = ROOT / 'convert_ignore.txt'
+
 DATA_DIR.mkdir(exist_ok=True)
 HTML_DIR.mkdir(exist_ok=True)
 MARKDOWN_DIR.mkdir(exist_ok=True)

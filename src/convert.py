@@ -24,9 +24,15 @@ individual image-only pages (observed directly in this corpus), and
 per-page auto-detection handles that correctly where a document-level
 split wouldn't.
 
+Files named in `convert_ignore.txt` (repo root; one filename per line,
+`#` comments) are skipped by the bulk run -- for PDFs that reliably time
+out or fail in MinerU. Naming files explicitly on the command line
+converts them regardless of the list.
+
 Run directly (from the `extract` environment):
     pixi run convert
     pixi run convert --limit 5   # smoke-test on a handful of each type first
+    pixi run convert 1965ApJS....9..321M.pdf   # force specific file(s)
 """
 
 from __future__ import annotations
@@ -95,13 +101,45 @@ def _convert_pdf_file(pdf_path: Path, tmp_dir: Path) -> str | None:
     return md if len(md) >= config.MIN_MARKDOWN_CHARS else None
 
 
-def convert(limit: int | None) -> None:
-    html_files = sorted(config.HTML_DIR.glob("*.html"))
-    pdf_files = sorted(config.PDF_DIR.glob("*.pdf"))
-    if limit:
-        html_files = html_files[:limit]
-        pdf_files = pdf_files[:limit]
-    print(f"Converting {len(html_files)} HTML + {len(pdf_files)} PDF files")
+def _load_ignored() -> set[str]:
+    if not config.CONVERT_IGNORE_PATH.exists():
+        return set()
+    lines = config.CONVERT_IGNORE_PATH.read_text(encoding="utf-8").splitlines()
+    return {name for line in lines if (name := line.split("#", 1)[0].strip())}
+
+
+def _resolve_targets(targets: list[str]) -> tuple[list[Path], list[Path]]:
+    html_files: list[Path] = []
+    pdf_files: list[Path] = []
+    for target in targets:
+        name = Path(target).name
+        if name.endswith(".html") and (config.HTML_DIR / name).exists():
+            html_files.append(config.HTML_DIR / name)
+        elif name.endswith(".pdf") and (config.PDF_DIR / name).exists():
+            pdf_files.append(config.PDF_DIR / name)
+        else:
+            print(f"  [skip] {target}: not found in data/html or data/pdf")
+    return html_files, pdf_files
+
+
+def convert(limit: int | None, targets: list[str] | None = None) -> None:
+    if targets:
+        html_files, pdf_files = _resolve_targets(targets)
+        ignored_note = ""
+    else:
+        ignored = _load_ignored()
+        html_files = sorted(config.HTML_DIR.glob("*.html"))
+        pdf_files = sorted(config.PDF_DIR.glob("*.pdf"))
+        n_total = len(html_files) + len(pdf_files)
+        # Filter before --limit so ignored files don't eat the limit.
+        html_files = [p for p in html_files if p.name not in ignored]
+        pdf_files = [p for p in pdf_files if p.name not in ignored]
+        n_ignored = n_total - len(html_files) - len(pdf_files)
+        ignored_note = f" ({n_ignored} ignored)" if n_ignored else ""
+        if limit:
+            html_files = html_files[:limit]
+            pdf_files = pdf_files[:limit]
+    print(f"Converting {len(html_files)} HTML + {len(pdf_files)} PDF files{ignored_note}")
 
     for path in html_files:
         md = _convert_html_file(path)
@@ -138,7 +176,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Convert raw HTML/PDF into Markdown")
+    parser.add_argument(
+        "targets", nargs="*",
+        help="Specific filenames in data/html or data/pdf to convert, bypassing convert_ignore.txt",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N files per type")
     args = parser.parse_args()
 
-    convert(limit=args.limit)
+    convert(limit=args.limit, targets=args.targets)
