@@ -21,6 +21,8 @@ _SECTION_CLASSES = {
     "ltx_section", "ltx_subsection", "ltx_subsubsection", "ltx_paragraph",
     "ltx_appendix", "ltx_subappendix",
 }
+_LIST_CLASSES = {"ltx_itemize", "ltx_enumerate", "ltx_description"}
+_EQUATION_CLASSES = {"ltx_equation", "ltx_equationgroup"}
 
 
 def _clean_text(text: str) -> str:
@@ -90,16 +92,50 @@ def _render_figure(fig: Tag) -> str:
     return f"**Figure.** {cap_text}" if cap_text else ""
 
 
+def _is_list(el: Tag) -> bool:
+    return el.name in ("ul", "ol", "dl") and bool(_LIST_CLASSES & set(el.get("class") or []))
+
+
+def _is_equation(el: Tag) -> bool:
+    return el.name == "table" and bool(_EQUATION_CLASSES & set(el.get("class") or []))
+
+
+def _render_list(lst: Tag) -> list[str]:
+    """One block per item (the item's own bullet/number tag stays in its
+    text), so items remain separable downstream instead of one flattened
+    blob. A nested list stays inside its parent item."""
+    blocks = []
+    term = ""
+    for item in lst.find_all(["li", "dt", "dd"], recursive=False):
+        text = _clean_text(item.get_text(" "))
+        if not text:
+            continue
+        if item.name == "dt":  # description list: term prefixes its definition
+            term = text
+            continue
+        blocks.append(f"{term} {text}" if term else text)
+        term = ""
+    return blocks
+
+
 def _render_para_div(div: Tag) -> list[str]:
-    paras = div.find_all("p", recursive=False)
-    if not paras:
+    # LaTeXML puts lists, display equations and inline floats as siblings of
+    # the <p> tags inside one ltx_para div; keeping only the <p>s silently
+    # dropped them (e.g. a "following these steps:" paragraph with its steps
+    # missing).
+    blocks = []
+    for child in div.find_all(recursive=False):
+        if child.name == "p" or _is_equation(child):
+            text = _clean_text(child.get_text(" "))
+            if text:
+                blocks.append(text)
+        elif _is_list(child):
+            blocks.extend(_render_list(child))
+        elif child.name in ("figure", "table"):
+            blocks.extend(_render_block(child, 0))
+    if not blocks:
         text = _clean_text(div.get_text(" "))
         return [text] if text else []
-    blocks = []
-    for p in paras:
-        text = _clean_text(p.get_text(" "))
-        if text:
-            blocks.append(text)
     return blocks
 
 
@@ -125,9 +161,16 @@ def _render_block(el: Tag | NavigableString, depth: int) -> list[str]:
         rendered = _render_figure(el)
         return [rendered] if rendered else []
 
+    if _is_equation(el):
+        text = _clean_text(el.get_text(" "))
+        return [text] if text else []
+
     if el.name == "table":
         rendered = _render_table(el)
         return [rendered] if rendered else []
+
+    if _is_list(el):
+        return _render_list(el)
 
     if el.name == "div" and "ltx_para" in (el.get("class") or []):
         return _render_para_div(el)

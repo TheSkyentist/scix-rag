@@ -1,0 +1,270 @@
+"""
+Embed every chunk in `chunks` with Qwen3-Embedding (run locally with MLX, bf16
+-- quantization saved memory but was slower, see CLAUDE.md) and store the
+vectors in `chunk_embeddings` in papers.duckdb.
+
+Embedded text for a chunk = paper title + heading path (+ blank line) + body,
+where body is the chunk text, or for `kind='table'` just the caption + header
+row (chunk.table_embed_text). `kind='boilerplate'` chunks are skipped unless
+--include-boilerplate. Documents get no instruction prefix; queries (retrieval
+stage) use Qwen3's "Instruct: ...\\nQuery: ..." format. The vector is the final
+hidden state of the appended <|endoftext|> token, L2-normalized, so cosine
+similarity is a dot product.
+
+`chunk_embeddings` is keyed (bibcode, chunk_index, model) and stores a hash of
+the exact embedded text. That is the "done" test: a chunk is pending if it has
+no row for this model or its stored hash differs from the current embedded
+text's. So re-chunking (which reshuffles chunk_index), a changed prefix
+(config.EMBED_TITLE_PREFIX) or an edited table rule all re-embed exactly the
+affected chunks instead of leaving stale vectors attached to the wrong text.
+Rows whose (bibcode, chunk_index) no longer exists in `chunks` are deleted on
+start. Vectors are stored as FLOAT[] (any dimension, so several models can
+coexist); cast with `embedding::FLOAT[1024]` for DuckDB's VSS/array functions.
+
+Chunks are pulled in paper order, collected into windows of about
+config.EMBED_COMMIT_TOKENS tokens, length-sorted inside each window (so
+batches pad little), embedded, and committed in one transaction -- Ctrl-C
+loses at most the window in flight, and re-running resumes.
+
+Run directly (from the `embed` environment):
+    pixi run embed
+    pixi run embed --limit 200            # smoke-test on the first 200 pending chunks
+    pixi run embed --model-size 4B        # the 4B model (~10x slower; vectors are 2560-d)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from pathlib import Path
+from typing import Iterator, NamedTuple
+
+import duckdb
+import mlx.core as mx
+import numpy as np
+from huggingface_hub import snapshot_download
+from mlx_lm.models.qwen3 import Model, ModelArgs
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+import config
+
+from .chunk import table_embed_text
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    bibcode     VARCHAR,
+    chunk_index INTEGER,
+    model       VARCHAR,
+    text_hash   VARCHAR,
+    embedding   FLOAT[],
+    PRIMARY KEY (bibcode, chunk_index, model)
+);
+"""
+
+_EOT = "<|endoftext|>"
+_INSERT_ROWS_PER_STATEMENT = 200
+
+
+class Embedded(NamedTuple):
+    vectors: np.ndarray  # (n, dim) float32, L2-normalized, in input order
+    n_tokens: int
+    n_truncated: int
+
+
+def load_embedder(size: str) -> tuple[Model, PreTrainedTokenizerBase]:
+    path = Path(snapshot_download(
+        f"Qwen/Qwen3-Embedding-{size}", allow_patterns=["*.json", "*.safetensors", "*.txt"]
+    ))
+    model = Model(ModelArgs.from_dict(json.loads((path / "config.json").read_text())))
+    weights: dict[str, mx.array] = {}
+    for f in sorted(path.glob("*.safetensors")):
+        weights.update(mx.load(str(f)))
+    # The HF embedding checkpoints omit the "model." key prefix mlx_lm's
+    # causal-LM wrapper expects (it is a plain Qwen3 backbone, no lm_head).
+    model.load_weights([
+        (k if k.startswith(("model.", "lm_head")) else f"model.{k}", v)
+        for k, v in weights.items()
+    ])
+    mx.eval(model.parameters())
+    return model, AutoTokenizer.from_pretrained(str(path))
+
+
+def embedded_text(
+    title: str | None, heading: str | None, kind: str, text: str,
+    tokenizer: PreTrainedTokenizerBase,
+) -> str:
+    """The exact string that gets embedded for a chunk. `heading` is the
+    chunk's heading_path, falling back to its section_heading."""
+    body = table_embed_text(text, tokenizer) if kind == "table" else text
+    prefix = "\n".join(p for p in (title if config.EMBED_TITLE_PREFIX else None, heading) if p)
+    return f"{prefix}\n\n{body}" if prefix else body
+
+
+def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
+    """Group length-sorted indices into batches capped by item count and by
+    padded tokens (items x longest), so one long chunk can't blow up memory."""
+    cur: list[int] = []
+    for i in order:
+        if cur and (len(cur) >= config.EMBED_MAX_BATCH or (len(cur) + 1) * len(ids[i]) > config.EMBED_BATCH_TOKENS):
+            yield cur
+            cur = []
+        cur.append(i)
+    if cur:
+        yield cur
+
+
+def embed_texts(model: Model, tokenizer: PreTrainedTokenizerBase, texts: list[str]) -> Embedded:
+    eot = tokenizer.convert_tokens_to_ids(_EOT)
+    cap = config.MAX_EMBED_TOKENS - 1
+    raw = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
+    n_truncated = sum(len(r) > cap for r in raw)
+    ids = [r[:cap] + [eot] for r in raw]
+    order = sorted(range(len(ids)), key=lambda i: len(ids[i]))
+
+    out: list[np.ndarray | None] = [None] * len(ids)
+    for batch in _batches(order, ids):
+        longest = max(len(ids[i]) for i in batch)
+        arr = mx.array([ids[i] + [eot] * (longest - len(ids[i])) for i in batch])
+        hidden = model.model(arr)  # causal, so right-padding can't affect earlier positions
+        last = mx.array([len(ids[i]) - 1 for i in batch])
+        v = hidden[mx.arange(len(batch)), last].astype(mx.float32)
+        v = v / mx.linalg.norm(v, axis=-1, keepdims=True)
+        mx.eval(v)
+        v = np.array(v)
+        for j, i in enumerate(batch):
+            out[i] = v[j]
+    return Embedded(np.stack(out), sum(map(len, ids)), n_truncated)
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _insert_vectors(
+    con: duckdb.DuckDBPyConnection, model_id: str,
+    items: list[tuple[str, int, str, str]], vectors: np.ndarray,
+) -> None:
+    """Upsert (bibcode, chunk_index, hash) items with their vectors. Vectors go
+    in as FLOAT[] SQL literals (%.9g round-trips float32 exactly) rather than
+    bound parameters: converting 1024 Python floats per row through
+    executemany cost ~40 ms/row, ~10x slower than the literal."""
+    if not np.isfinite(vectors).all():
+        raise ValueError("non-finite values in embeddings")
+    for s in range(0, len(items), _INSERT_ROWS_PER_STATEMENT):
+        part = range(s, min(s + _INSERT_ROWS_PER_STATEMENT, len(items)))
+        sql = "INSERT OR REPLACE INTO chunk_embeddings VALUES " + ",".join(
+            "(?, ?, ?, ?, [" + ",".join(f"{x:.9g}" for x in vectors[k]) + "]::FLOAT[])" for k in part
+        )
+        con.execute(sql, [p for k in part for p in (items[k][0], items[k][1], model_id, items[k][3])])
+
+
+def _pending(
+    con: duckdb.DuckDBPyConnection, model_id: str, tokenizer: PreTrainedTokenizerBase,
+    include_boilerplate: bool,
+) -> Iterator[tuple[str, int, str, str]]:
+    """Yield (bibcode, chunk_index, embedded_text, hash) for every chunk whose
+    stored hash for this model is missing or stale, in paper order."""
+    done = {
+        (b, i): h for b, i, h in con.execute(
+            "SELECT bibcode, chunk_index, text_hash FROM chunk_embeddings WHERE model = ?", [model_id]
+        ).fetchall()
+    }
+    cur = con.cursor()  # separate connection, so window inserts don't disturb the scan
+    cur.execute(
+        """SELECT c.bibcode, c.chunk_index, c.kind, c.section_heading, c.heading_path, c.text, p.title
+           FROM chunks c JOIN papers p USING (bibcode)
+           WHERE ? OR c.kind <> 'boilerplate'
+           ORDER BY c.bibcode, c.chunk_index""",
+        [include_boilerplate],
+    )
+    while rows := cur.fetchmany(2000):
+        for bibcode, idx, kind, section_heading, heading_path, text, title in rows:
+            et = embedded_text(title, heading_path or section_heading, kind, text, tokenizer)
+            h = _hash(et)
+            if done.get((bibcode, idx)) != h:
+                yield bibcode, idx, et, h
+
+
+def embed(limit: int | None = None, size: str = config.EMBED_MODEL_SIZE, include_boilerplate: bool = False) -> None:
+    con = duckdb.connect(str(config.DB_PATH))
+    try:
+        columns = {r[1] for r in con.execute("PRAGMA table_info('chunks')").fetchall()}
+        if not {"kind", "heading_path"} <= columns:
+            raise SystemExit("chunks table is missing or has the old schema; run `pixi run chunk --rebuild` first")
+        con.execute(_SCHEMA)
+        model_id = f"Qwen3-Embedding-{size}"
+
+        orphans = con.execute(
+            """DELETE FROM chunk_embeddings e WHERE NOT EXISTS
+               (SELECT 1 FROM chunks c WHERE c.bibcode = e.bibcode AND c.chunk_index = e.chunk_index)
+               RETURNING 1"""
+        ).fetchall()
+        if orphans:
+            print(f"Deleted {len(orphans)} embeddings whose chunk no longer exists")
+
+        eligible = con.execute(
+            "SELECT count(*) FROM chunks WHERE ? OR kind <> 'boilerplate'", [include_boilerplate]
+        ).fetchone()[0]
+        have = con.execute("SELECT count(*) FROM chunk_embeddings WHERE model = ?", [model_id]).fetchone()[0]
+        est_pending = max(eligible - have, 0)
+        target = min(est_pending, limit) if limit else est_pending
+        print(f"{model_id}: {have}/{eligible} chunks already embedded; ~{est_pending} pending"
+              + (f", stopping after {limit}" if limit else ""))
+        if not target:
+            return
+
+        model, tokenizer = load_embedder(size)
+
+        n_done = n_tokens = n_truncated = 0
+        t0 = time.perf_counter()
+        window: list[tuple[str, int, str, str]] = []
+        window_est = 0
+
+        def flush() -> None:
+            nonlocal window, window_est, n_done, n_tokens, n_truncated
+            if not window:
+                return
+            emb = embed_texts(model, tokenizer, [w[2] for w in window])
+            con.begin()
+            try:
+                _insert_vectors(con, model_id, [(b, i, et, h) for b, i, et, h in window], emb.vectors)
+                con.commit()
+            except BaseException:
+                con.rollback()
+                raise
+            n_done += len(window)
+            n_tokens += emb.n_tokens
+            n_truncated += emb.n_truncated
+            window, window_est = [], 0
+            mx.clear_cache()
+            dt = time.perf_counter() - t0
+            eta_h = (target - n_done) / (n_done / dt) / 3600
+            print(f"  {n_done}/{target} chunks | {n_tokens / dt:.0f} tok/s | ETA {eta_h:.1f} h", flush=True)
+
+        for item in _pending(con, model_id, tokenizer, include_boilerplate):
+            if limit and n_done + len(window) >= limit:
+                break
+            window.append(item)
+            window_est += len(item[2]) // 3  # ~3.5 chars/token; only used to size the commit window
+            if window_est >= config.EMBED_COMMIT_TOKENS:
+                flush()
+        flush()
+
+        dt = time.perf_counter() - t0
+        print(f"Embedded {n_done} chunks ({n_tokens} tokens, {n_truncated} truncated at "
+              f"{config.MAX_EMBED_TOKENS}) in {dt / 60:.1f} min")
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Embed chunks with Qwen3-Embedding (MLX) into chunk_embeddings")
+    parser.add_argument("--limit", type=int, default=None, help="Stop after embedding N pending chunks")
+    parser.add_argument("--model-size", default=config.EMBED_MODEL_SIZE, choices=["0.6B", "4B"], help="Qwen3-Embedding size")
+    parser.add_argument("--include-boilerplate", action="store_true", help="Also embed kind='boilerplate' chunks")
+    args = parser.parse_args()
+
+    embed(limit=args.limit, size=args.model_size, include_boilerplate=args.include_boilerplate)

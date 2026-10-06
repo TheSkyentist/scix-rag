@@ -45,6 +45,9 @@ chunk = "python -m src.chunk"
 mlx = ">=0.32.0,<0.33"
 mlx-lm = ">=0.31.3,<0.32"
 
+[feature.embed.tasks]
+embed = "python -m src.embed"
+
 [environments]
 query = { features = ["query"] }
 fetch = { features = ["fetch"] }

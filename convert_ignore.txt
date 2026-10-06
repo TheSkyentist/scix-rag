@@ -1,0 +1,12 @@
+# Raw files the bulk `pixi run convert` skips (one filename per line, # comments).
+# Force one anyway with: pixi run convert <filename>
+1965ApJS....9..321M.pdf  # fails to convert (add reason)
+1966sst..book.....M.pdf  # fails to convert (add reason)
+1967MNRAS.136..101L.pdf  # fails to convert (add reason)
+1979ApJS...40....1K.pdf  # fails to convert (add reason)
+1981PASP...93..817B.pdf  # fails to convert (add reason)
+1987MNRAS.224..801H.pdf  # fails to convert (add reason)
+1989ApJS...70....1A.pdf  # fails to convert (add reason)
+1992A&AS...96..269S.pdf  # fails to convert (add reason)
+2000A&A...361..901K.pdf  # fails to convert (add reason)
+2005.06505.pdf  # fails to convert (add reason)

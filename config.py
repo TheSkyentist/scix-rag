@@ -29,6 +29,15 @@ ADS_FIELDS = (
 )
 
 MAX_CHUNK_TOKENS = 1024
+MAX_TABLE_EMBED_TOKENS = 256  # tables are stored whole but only caption + header row get embedded
+
+# Embedding stage (src/embed.py)
+EMBED_MODEL_SIZE = '0.6B'  # Qwen3-Embedding-{0.6B,4B}; bf16 only (8-/4-bit were slower, not faster)
+MAX_EMBED_TOKENS = 8192  # chunks longer than this are truncated (model context is 32K)
+EMBED_BATCH_TOKENS = 16384  # max padded tokens (items x longest) per forward pass
+EMBED_MAX_BATCH = 16
+EMBED_COMMIT_TOKENS = 250_000  # ~tokens embedded between DB commits; bounds what Ctrl-C can lose
+EMBED_TITLE_PREFIX = True  # prepend the paper title to each chunk's embedded text (open question)
 ADS_PAGE_SIZE = 200
 ADS_BATCH_SIZE = 75  # bibcodes per OR'd batch-fetch query
 ADS_DELAY = 0.5  # seconds between ADS requests
