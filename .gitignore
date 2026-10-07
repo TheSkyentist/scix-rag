@@ -9,4 +9,7 @@ data/html/
 data/markdown/
 data/pdf/
 
-# papers.duckdb IS meant to be committed -- do not ignore it.
+# The corpus database (papers, citation edges, chunks, embeddings) is multi-GB and
+# lives only on disk: never commit it. Back it up outside git.
+*.duckdb
+*.duckdb.wal
