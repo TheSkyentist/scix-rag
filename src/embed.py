@@ -72,10 +72,33 @@ class Embedded(NamedTuple):
     n_truncated: int
 
 
-def load_embedder(size: str) -> tuple[Model, PreTrainedTokenizerBase]:
-    path = Path(snapshot_download(
-        f"Qwen/Qwen3-Embedding-{size}", allow_patterns=["*.json", "*.safetensors", "*.txt"]
-    ))
+_HF_PATTERNS = ["*.json", "*.safetensors", "*.txt"]
+
+
+def _weights_complete(path: Path) -> bool:
+    index = path / "model.safetensors.index.json"
+    if index.exists():  # sharded checkpoint: every listed shard must be present
+        shards = set(json.loads(index.read_text())["weight_map"].values())
+        return all((path / s).exists() for s in shards)
+    return any(path.glob("*.safetensors"))
+
+
+def _model_dir(size: str, offline_first: bool) -> Path:
+    repo = f"Qwen/Qwen3-Embedding-{size}"
+    if offline_first:
+        # snapshot_download normally checks the Hub for a newer revision on
+        # every call; a query CLI shouldn't need the network once cached.
+        try:
+            path = Path(snapshot_download(repo, allow_patterns=_HF_PATTERNS, local_files_only=True))
+            if (path / "config.json").exists() and _weights_complete(path):
+                return path
+        except Exception:  # not cached (or partial): fall through to the normal path
+            pass
+    return Path(snapshot_download(repo, allow_patterns=_HF_PATTERNS))
+
+
+def load_embedder(size: str, offline_first: bool = False) -> tuple[Model, PreTrainedTokenizerBase]:
+    path = _model_dir(size, offline_first)
     model = Model(ModelArgs.from_dict(json.loads((path / "config.json").read_text())))
     weights: dict[str, mx.array] = {}
     for f in sorted(path.glob("*.safetensors")):
@@ -99,6 +122,12 @@ def embedded_text(
     body = table_embed_text(text, tokenizer) if kind == "table" else text
     prefix = "\n".join(p for p in (title if config.EMBED_TITLE_PREFIX else None, heading) if p)
     return f"{prefix}\n\n{body}" if prefix else body
+
+
+def format_query(query: str) -> str:
+    """Counterpart of embedded_text() for retrieval: queries carry Qwen3's
+    task instruction, documents don't."""
+    return f"Instruct: {config.QUERY_INSTRUCTION}\nQuery:{query}"
 
 
 def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
@@ -202,6 +231,20 @@ def embed(limit: int | None = None, size: str = config.EMBED_MODEL_SIZE, include
         ).fetchall()
         if orphans:
             print(f"Deleted {len(orphans)} embeddings whose chunk no longer exists")
+
+        if not include_boilerplate:
+            # A chunk re-classified as boilerplate keeps its (bibcode, chunk_index), so
+            # it isn't an orphan -- but it's no longer eligible, and search scores every
+            # row of chunk_embeddings. Drop its vector for this model.
+            demoted = con.execute(
+                """DELETE FROM chunk_embeddings e WHERE e.model = ? AND EXISTS
+                   (SELECT 1 FROM chunks c WHERE c.bibcode = e.bibcode
+                      AND c.chunk_index = e.chunk_index AND c.kind = 'boilerplate')
+                   RETURNING 1""",
+                [model_id],
+            ).fetchall()
+            if demoted:
+                print(f"Deleted {len(demoted)} embeddings of chunks now tagged boilerplate")
 
         eligible = con.execute(
             "SELECT count(*) FROM chunks WHERE ? OR kind <> 'boilerplate'", [include_boilerplate]

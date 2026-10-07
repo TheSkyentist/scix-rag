@@ -22,7 +22,8 @@ Every chunk has a `kind`:
                embedded. A section's tables are emitted after its prose chunks
                so they don't fragment the prose.
   boilerplate  acknowledgements, data-availability, author-contribution,
-               conflict-of-interest, funding and (leaked) reference sections.
+               conflict-of-interest, funding, (leaked) reference sections and
+               leaked front matter (author lists, affiliations, ORCIDs, keywords).
                Kept so they stay searchable on request, but the embed stage
                can skip them by default.
 
@@ -83,7 +84,13 @@ _NUMBERING_RE = re.compile(r"^(?:[0-9]+(?:\.[0-9]+)*\.?|[IVXL]+\.?|[A-Z]\.)\s+")
 _BOILERPLATE_RE = re.compile(
     r"(acknowledg|data availab|availability of|code availab|author contribution|"
     r"competing interest|conflicts? of interest|disclosure|declaration of|funding|"
-    r"bibliography|literature cited|works cited)|(references?|reference list)\s*$"
+    r"bibliography|literature cited|works cited)|(references?|reference list)\s*$|"
+    # Front matter that leaked into the body (whole-heading matches only, so
+    # "Comparison to other authors" and the like stay prose).
+    r"(affiliations?|authors?|authors?[’'] affiliations?|authors? and affiliations?|"
+    r"author information|author list|complete author list( and affiliations?)?|"
+    r"corresponding authors?|orcid( id)?s?|keywords?|special capabilities needed)"
+    r"[\s:.]*$"
 )
 
 _TABLE_LINE_MIN_PIPES = 2

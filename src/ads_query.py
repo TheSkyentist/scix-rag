@@ -118,6 +118,8 @@ ON CONFLICT (citing_bibcode, cited_bibcode) DO NOTHING
 
 
 def _session() -> httpx.Client:
+    if not config.ADS_API_KEY:
+        raise SystemExit('ADS_API_KEY is not set (put it in .env or the environment)')
     return httpx.Client(
         headers={'Authorization': f'Bearer {config.ADS_API_KEY}'}, timeout=30
     )

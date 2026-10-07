@@ -20,7 +20,9 @@ HTML_DIR.mkdir(exist_ok=True)
 MARKDOWN_DIR.mkdir(exist_ok=True)
 PDF_DIR.mkdir(exist_ok=True)
 
-ADS_API_KEY = os.environ['ADS_API_KEY']
+# Optional at import so non-ADS stages (search, chunk, embed) run without .env;
+# src/ads_query.py raises a clear error when it actually needs the key.
+ADS_API_KEY = os.environ.get('ADS_API_KEY')
 ADS_BASE_URL = 'https://api.adsabs.harvard.edu/v1'
 ADS_FIELDS = (
     'bibcode,alternate_bibcode,identifier,title,author,first_author,'
@@ -38,6 +40,11 @@ EMBED_BATCH_TOKENS = 16384  # max padded tokens (items x longest) per forward pa
 EMBED_MAX_BATCH = 16
 EMBED_COMMIT_TOKENS = 250_000  # ~tokens embedded between DB commits; bounds what Ctrl-C can lose
 EMBED_TITLE_PREFIX = True  # prepend the paper title to each chunk's embedded text (open question)
+# Qwen3-Embedding wants queries (not documents) as "Instruct: {task}\nQuery:{query}".
+QUERY_INSTRUCTION = (
+    'Given a question or topic from astrophysics research, retrieve passages '
+    'from scientific papers that answer or discuss it'
+)
 ADS_PAGE_SIZE = 200
 ADS_BATCH_SIZE = 75  # bibcodes per OR'd batch-fetch query
 ADS_DELAY = 0.5  # seconds between ADS requests

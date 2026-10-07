@@ -48,9 +48,15 @@ mlx-lm = ">=0.31.3,<0.32"
 [feature.embed.tasks]
 embed = "python -m src.embed"
 
+# Literature search CLI (src/search.py). Same packages as `embed` (it needs mlx to embed the
+# query); a separate environment so querying never touches an env a long embed job is running in.
+[feature.search.tasks]
+search = "python -m src.search"
+
 [environments]
 query = { features = ["query"] }
 fetch = { features = ["fetch"] }
 extract = { features = ["extract"] }
 chunk = { features = ["chunk"] }
 embed = { features = ["embed"] }
+search = { features = ["embed", "search"] }
