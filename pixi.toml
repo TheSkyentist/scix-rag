@@ -15,6 +15,7 @@ httpx = ">=0.28.1,<0.29"
 
 [feature.query.tasks]
 query = "python -m src.ads_query"
+canonicalize = "python -m src.canonicalize"
 
 [feature.fetch.dependencies]
 httpx = ">=0.28.1,<0.29"
@@ -52,6 +53,16 @@ embed = "python -m src.embed"
 # query); a separate environment so querying never touches an env a long embed job is running in.
 [feature.search.tasks]
 search = "python -m src.search"
+
+# Everything after a `pixi run query ...`, in order. Each stage lives in its own environment (and `embed` also exists in
+# `search`), so the environment is spelled out. Re-running is safe: every stage resumes.
+[tasks]
+all = { description = "fetch -> convert -> chunk -> embed (run `query` first)", depends-on = [
+    { task = "fetch", environment = "fetch" },
+    { task = "convert", environment = "extract" },
+    { task = "chunk", environment = "chunk" },
+    { task = "embed", environment = "embed" },
+] }
 
 [environments]
 query = { features = ["query"] }

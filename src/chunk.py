@@ -321,11 +321,20 @@ def chunk(limit: int | None = None, rebuild: bool = False) -> None:
     already_chunked = {
         r[0] for r in con.execute("SELECT DISTINCT bibcode FROM chunks").fetchall()
     }
+    # A paper that gained an arxiv_id after being chunked (fetch --refresh) now has a different
+    # stem and source text; its old chunks are replaced once the new Markdown exists.
+    stale = {
+        r[0]
+        for r in con.execute(
+            """SELECT DISTINCT c.bibcode FROM chunks c JOIN papers p USING (bibcode)
+               WHERE c.arxiv_id IS DISTINCT FROM p.arxiv_id"""
+        ).fetchall()
+    }
     all_papers = con.execute("SELECT bibcode, arxiv_id FROM papers").fetchall()
     todo = [
         (bibcode, arxiv_id)
         for bibcode, arxiv_id in all_papers
-        if bibcode not in already_chunked
+        if (bibcode not in already_chunked or bibcode in stale)
         and (config.MARKDOWN_DIR / f"{arxiv_id or bibcode}.md").exists()
     ]
     if limit:
@@ -338,6 +347,8 @@ def chunk(limit: int | None = None, rebuild: bool = False) -> None:
         stem = arxiv_id or bibcode
         markdown = (config.MARKDOWN_DIR / f"{stem}.md").read_text(encoding="utf-8")
         packed = chunk_paper(markdown, tokenizer)
+        if bibcode in stale:
+            con.execute("DELETE FROM chunks WHERE bibcode = ?", [bibcode])
         rows = [
             (bibcode, arxiv_id, i, c.heading, c.heading_path, c.kind, c.text, c.n_tokens)
             for i, c in enumerate(packed)

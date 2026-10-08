@@ -26,9 +26,26 @@ every run trivially resumable, at the cost of retrying genuinely
 unrecoverable papers on every run (no permanent "gave up" marker) -- a
 deliberate simplicity-over-efficiency tradeoff.
 
+Papers where every source answered definitively "no" are appended to
+`fetch_ignore.txt` (repo root, committed; same format as convert_ignore.txt)
+and skipped on later runs, so they aren't re-tried every time. Network
+errors, timeouts, 429s and 5xx are *not* recorded -- those retry next run.
+Delete a line (or pass --retry-failed) to try a paper again.
+
+`--refresh` re-queries ADS for papers that still have no arxiv_id (a preprint
+is often merged into the journal record after we ingested it, and ads_query
+never revisits known bibcodes), updating arxiv_id / alternate_bibcode /
+esources, then fetches as usual. A paper that gains an arxiv_id changes stem
+(bibcode -> arxiv_id), so its old ignore line stops matching and it is retried
+via arXiv; once the arXiv copy lands, leftover files under the old stem are
+deleted, and `chunk` re-chunks it (it notices chunks.arxiv_id no longer matches).
+
 Run directly:
     pixi run fetch
     pixi run fetch --limit 5   # smoke-test on a handful first
+    pixi run fetch --retry-failed
+    pixi run fetch --refresh --dry-run [--since 2008]   # report what would change
+    pixi run fetch --refresh [--since 2008]
 """
 
 from __future__ import annotations
@@ -41,6 +58,7 @@ import httpx
 import config
 
 from .ads_query import _fetch_many_by_bibcode, _session
+from .canonicalize import run as canonicalize
 from .html_to_markdown import convert
 
 _ARXIV_HTML_URLS = [
@@ -49,6 +67,33 @@ _ARXIV_HTML_URLS = [
 ]
 _GATEWAY = "https://ui.adsabs.harvard.edu/link_gateway/{bibcode}/{esource}"
 _ESOURCE_PRIORITY = ["PUB_PDF", "ADS_PDF", "EPRINT_PDF"]
+
+
+class _Transient(Exception):
+    """A failure that says nothing about whether the paper is fetchable."""
+
+
+def _load_failed() -> set[str]:
+    if not config.FETCH_IGNORE_PATH.exists():
+        return set()
+    lines = config.FETCH_IGNORE_PATH.read_text(encoding="utf-8").splitlines()
+    return {name for line in lines if (name := line.split("#", 1)[0].strip())}
+
+
+def _record_failed(stem: str, reason: str) -> None:
+    new_file = not config.FETCH_IGNORE_PATH.exists()
+    with config.FETCH_IGNORE_PATH.open("a", encoding="utf-8") as f:
+        if new_file:
+            f.write(
+                "# Papers `pixi run fetch` found nothing fetchable for (appended automatically;\n"
+                "# one stem per line). Skipped unless: pixi run fetch --retry-failed\n"
+            )
+        f.write(f"{stem}  # {reason}\n")
+
+
+def _check(resp: httpx.Response) -> None:
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise _Transient(f"HTTP {resp.status_code}")
 
 
 def _done(stem: str) -> bool:
@@ -62,8 +107,9 @@ def _done(stem: str) -> bool:
 def _fetch_url_pdf(url: str, client: httpx.Client) -> bytes | None:
     try:
         resp = client.get(url, follow_redirects=True, timeout=60)
-    except httpx.RequestError:
-        return None
+    except httpx.RequestError as e:
+        raise _Transient(type(e).__name__) from e
+    _check(resp)
     if resp.status_code != 200 or "application/pdf" not in resp.headers.get("content-type", ""):
         return None
     return resp.content
@@ -75,8 +121,9 @@ def _fetch_arxiv_html(arxiv_id: str, client: httpx.Client) -> str | None:
         url = url_template.format(arxiv_id=arxiv_id)
         try:
             resp = client.get(url, follow_redirects=True, timeout=30)
-        except httpx.RequestError:
-            continue
+        except httpx.RequestError as e:
+            raise _Transient(type(e).__name__) from e
+        _check(resp)
         if resp.status_code != 200 or "text/html" not in resp.headers.get("content-type", ""):
             continue
         try:
@@ -122,12 +169,50 @@ def _backfill_esources(con: duckdb.DuckDBPyConnection, bibcodes: list[str]) -> N
     con.commit()
 
 
-def fetch(limit: int | None) -> None:
+def _refresh_links(con: duckdb.DuckDBPyConnection, since: int | None, dry_run: bool) -> None:
+    """Re-query ADS for papers without an arxiv_id and let canonicalize fold in what changed
+    (preprint merged into the journal record, twin rows, retired bibcodes)."""
+    sql, params = "SELECT bibcode FROM papers WHERE arxiv_id IS NULL", []
+    if since:
+        sql, params = sql + " AND year >= ?", [since]
+    bibcodes = [r[0] for r in con.execute(sql, params).fetchall()]
+    print(f"Refreshing ADS links for {len(bibcodes)} papers without an arxiv_id...")
+    with _session() as client:
+        docs = _fetch_many_by_bibcode(client, bibcodes)
+    canonicalize(con, docs, apply=not dry_run)
+
+
+def _drop_old_stem(bibcode: str) -> None:
+    """A paper that gained an arxiv_id switched stems; once its arXiv copy is on disk,
+    delete what's left under the old bibcode stem (chunk.py re-chunks from the new one)."""
+    for directory, ext in ((config.MARKDOWN_DIR, "md"), (config.HTML_DIR, "html"), (config.PDF_DIR, "pdf")):
+        old = directory / f"{bibcode}.{ext}"
+        if old.exists():
+            old.unlink()
+            print(f"  [drop] {old.relative_to(config.ROOT)}")
+
+
+def fetch(
+    limit: int | None,
+    retry_failed: bool = False,
+    refresh: bool = False,
+    since: int | None = None,
+    dry_run: bool = False,
+) -> None:
     con = duckdb.connect(str(config.DB_PATH))
     con.execute("ALTER TABLE papers ADD COLUMN IF NOT EXISTS esources VARCHAR[]")
 
+    if refresh:
+        _refresh_links(con, since, dry_run)
+        if dry_run:
+            con.close()
+            return
+
     all_papers = con.execute("SELECT bibcode, arxiv_id FROM papers").fetchall()
-    todo_bibcodes = [b for b, a in all_papers if not _done(a or b)]
+    failed = set() if retry_failed else _load_failed()
+    todo_bibcodes = [b for b, a in all_papers if not _done(a or b) and (a or b) not in failed]
+    if failed:
+        print(f"Skipping {len(failed)} papers listed in {config.FETCH_IGNORE_PATH.name} (--retry-failed to retry)")
     if limit:
         todo_bibcodes = todo_bibcodes[:limit]
 
@@ -148,12 +233,16 @@ def fetch(limit: int | None) -> None:
     with httpx.Client(headers={"User-Agent": "arXivRAG/0.1 (research pipeline)"}) as client:
         for bibcode, arxiv_id, esources in todo:
             stem = arxiv_id or bibcode
-            if arxiv_id:
-                result = _fetch_arxiv(arxiv_id, client)
-                delay = config.ARXIV_DELAY
-            else:
-                result = _fetch_ads(bibcode, esources, client)
-                delay = config.ADS_DELAY
+            delay = config.ARXIV_DELAY if arxiv_id else config.ADS_DELAY
+            try:
+                if arxiv_id:
+                    result = _fetch_arxiv(arxiv_id, client)
+                else:
+                    result = _fetch_ads(bibcode, esources, client)
+            except _Transient as e:
+                print(f"  [retry] {stem}: {e} (not recorded)")
+                time.sleep(delay)
+                continue
 
             if result:
                 kind, content = result
@@ -162,8 +251,19 @@ def fetch(limit: int | None) -> None:
                 else:
                     (config.PDF_DIR / f"{stem}.pdf").write_bytes(content)
                 print(f"  [{kind}] {stem}")
+                if arxiv_id:
+                    _drop_old_stem(bibcode)
             else:
                 print(f"  [fail] {stem}: nothing fetchable")
+                if esources is None and not arxiv_id:
+                    continue  # esources lookup failed upstream; not evidence the paper is unfetchable
+                if arxiv_id:
+                    reason = "no arXiv HTML/PDF"
+                else:
+                    reason = f"no ADS PDF source (esources: {', '.join(esources or []) or 'none'})"
+                if stem not in failed:
+                    _record_failed(stem, reason)
+                    failed.add(stem)
             time.sleep(delay)
 
     con.close()
@@ -174,6 +274,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Fetch raw HTML/PDF for papers not yet converted")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N pending papers")
+    parser.add_argument("--retry-failed", action="store_true", help="Also retry papers listed in fetch_ignore.txt")
+    parser.add_argument("--refresh", action="store_true", help="Re-query ADS for papers with no arxiv_id first")
+    parser.add_argument("--since", type=int, default=None, help="With --refresh: only papers from this year on")
+    parser.add_argument("--dry-run", action="store_true", help="With --refresh: report what would change, write nothing, don't fetch")
     args = parser.parse_args()
+    if (args.since or args.dry_run) and not args.refresh:
+        parser.error("--since/--dry-run need --refresh")
 
-    fetch(limit=args.limit)
+    fetch(limit=args.limit, retry_failed=args.retry_failed, refresh=args.refresh, since=args.since, dry_run=args.dry_run)

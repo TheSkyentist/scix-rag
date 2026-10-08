@@ -15,6 +15,10 @@ PDF_DIR = DATA_DIR / 'pdf'
 # the repo root (not under data/) so it's committed, unlike data/pdf/.
 CONVERT_IGNORE_PATH = ROOT / 'convert_ignore.txt'
 
+# Papers `fetch` found nothing fetchable for (appended automatically; one
+# stem per line with a `# reason`). Skipped on later runs unless --retry-failed.
+FETCH_IGNORE_PATH = ROOT / 'fetch_ignore.txt'
+
 DATA_DIR.mkdir(exist_ok=True)
 HTML_DIR.mkdir(exist_ok=True)
 MARKDOWN_DIR.mkdir(exist_ok=True)

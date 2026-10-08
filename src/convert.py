@@ -26,13 +26,18 @@ split wouldn't.
 
 Files named in `convert_ignore.txt` (repo root; one filename per line,
 `#` comments) are skipped by the bulk run -- for PDFs that reliably time
-out or fail in MinerU. Naming files explicitly on the command line
-converts them regardless of the list.
+out or fail in MinerU. The bulk run appends to it itself (`name  # reason`)
+whenever a file times out (MinerU's 1800 s limit), makes `mineru-kit` exit
+non-zero, or converts to too little text. Other exceptions (I/O errors
+etc.) are only printed, so they retry next run. Naming files explicitly on
+the command line converts them regardless of the list and never records
+anything; `--retry-failed` does the same for the whole bulk run.
 
 Run directly (from the `extract` environment):
     pixi run convert
     pixi run convert --limit 5   # smoke-test on a handful of each type first
     pixi run convert 1965ApJS....9..321M.pdf   # force specific file(s)
+    pixi run convert --retry-failed            # also retry convert_ignore.txt entries
 """
 
 from __future__ import annotations
@@ -108,6 +113,18 @@ def _load_ignored() -> set[str]:
     return {name for line in lines if (name := line.split("#", 1)[0].strip())}
 
 
+def _record_failed(name: str, reason: str, ignored: set[str]) -> None:
+    if name in ignored:
+        return
+    path = config.CONVERT_IGNORE_PATH
+    needs_newline = path.exists() and path.stat().st_size and not path.read_text(encoding="utf-8").endswith("\n")
+    with path.open("a", encoding="utf-8") as f:
+        if needs_newline:
+            f.write("\n")
+        f.write(f"{name}  # {reason}\n")
+    ignored.add(name)
+
+
 def _resolve_targets(targets: list[str]) -> tuple[list[Path], list[Path]]:
     html_files: list[Path] = []
     pdf_files: list[Path] = []
@@ -122,7 +139,9 @@ def _resolve_targets(targets: list[str]) -> tuple[list[Path], list[Path]]:
     return html_files, pdf_files
 
 
-def convert(limit: int | None, targets: list[str] | None = None) -> None:
+def convert(limit: int | None, targets: list[str] | None = None, retry_failed: bool = False) -> None:
+    record = not targets  # explicit targets are deliberate retries; never recorded
+    ignored: set[str] = set()
     if targets:
         html_files, pdf_files = _resolve_targets(targets)
         ignored_note = ""
@@ -132,8 +151,9 @@ def convert(limit: int | None, targets: list[str] | None = None) -> None:
         pdf_files = sorted(config.PDF_DIR.glob("*.pdf"))
         n_total = len(html_files) + len(pdf_files)
         # Filter before --limit so ignored files don't eat the limit.
-        html_files = [p for p in html_files if p.name not in ignored]
-        pdf_files = [p for p in pdf_files if p.name not in ignored]
+        if not retry_failed:
+            html_files = [p for p in html_files if p.name not in ignored]
+            pdf_files = [p for p in pdf_files if p.name not in ignored]
         n_ignored = n_total - len(html_files) - len(pdf_files)
         ignored_note = f" ({n_ignored} ignored)" if n_ignored else ""
         if limit:
@@ -149,6 +169,8 @@ def convert(limit: int | None, targets: list[str] | None = None) -> None:
             print(f"  [ok]   {path.stem} ({len(md)} chars)")
         else:
             print(f"  [fail] {path.stem}: converted to too little, left in place for review")
+            if record:
+                _record_failed(path.name, "converted to too little text", ignored)
 
     if not pdf_files:
         return
@@ -157,8 +179,15 @@ def convert(limit: int | None, targets: list[str] | None = None) -> None:
         for path in pdf_files:
             try:
                 md = _convert_pdf_file(path, Path(tmp_dir))
+            except subprocess.TimeoutExpired:
+                print(f"  [fail] {path.stem}: mineru-kit timed out")
+                if record:
+                    _record_failed(path.name, "MinerU timeout (1800s)", ignored)
+                continue
             except subprocess.CalledProcessError as e:
                 print(f"  [fail] {path.stem}: mineru-kit exited {e.returncode}: {e.stderr[-500:]}")
+                if record:
+                    _record_failed(path.name, f"mineru-kit exited {e.returncode}", ignored)
                 continue
             except Exception as e:
                 print(f"  [fail] {path.stem}: {e}")
@@ -170,6 +199,8 @@ def convert(limit: int | None, targets: list[str] | None = None) -> None:
                 print(f"  [ok]   {path.stem} ({len(md)} chars)")
             else:
                 print(f"  [fail] {path.stem}: converted to too little, left in place for review")
+                if record:
+                    _record_failed(path.name, "converted to too little text", ignored)
 
 
 if __name__ == "__main__":
@@ -181,6 +212,7 @@ if __name__ == "__main__":
         help="Specific filenames in data/html or data/pdf to convert, bypassing convert_ignore.txt",
     )
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N files per type")
+    parser.add_argument("--retry-failed", action="store_true", help="Also retry files listed in convert_ignore.txt")
     args = parser.parse_args()
 
-    convert(limit=args.limit, targets=args.targets)
+    convert(limit=args.limit, targets=args.targets, retry_failed=args.retry_failed)

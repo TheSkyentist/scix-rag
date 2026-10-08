@@ -326,6 +326,11 @@ if __name__ == '__main__':
         action='store_true',
         help='With --query, skip pulling citations (references only)',
     )
+    parser.add_argument(
+        '--no-canonicalize',
+        action='store_true',
+        help='Skip the final pass that merges papers ADS has re-keyed (see canonicalize.py)',
+    )
     args = parser.parse_args()
 
     if args.bibcode:
@@ -338,3 +343,11 @@ if __name__ == '__main__':
         )
     else:
         parser.error('pass --bibcode or --query')
+
+    if not args.no_canonicalize:
+        # ADS re-keys records over time (preprint -> journal bibcode, gained arXiv ids), which
+        # leaves twin rows and stale ids behind; fold every paper back onto its canonical bibcode.
+        from .canonicalize import canonicalize
+
+        print('\nCanonicalizing against ADS...')
+        canonicalize(apply=True)
