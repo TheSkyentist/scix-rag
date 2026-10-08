@@ -1,12 +1,12 @@
 #!/bin/sh
-# Literature search over the local arXivRAG index (src/search.py). Runs the `search`
+# Literature search over the local arXivRAG index (src/search.py). Runs the `embed`
 # pixi environment's python directly: no pixi startup, no re-solve, and no task-shell
 # re-parsing of arguments (bibcodes contain '&'). Works from any directory.
 # Usage: arxivrag-search {search|chunk|paper|grep|status} ...   (see --help)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PY="$ROOT/.pixi/envs/search/bin/python"
+PY="$ROOT/.pixi/envs/embed/bin/python"
 if [ ! -x "$PY" ]; then
-    echo "search environment missing: run 'pixi install -e search' in $ROOT" >&2
+    echo "embed environment missing: run 'pixi install -e embed' in $ROOT" >&2
     exit 3
 fi
 cd "$ROOT" && exec "$PY" -m src.search "$@"

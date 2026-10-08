@@ -28,7 +28,7 @@ and their scores for all query variants are computed in a single pass. The big
 Only `search` imports mlx/transformers, so the other subcommands start fast.
 
 Run via the wrapper (bin/arxivrag-search) or, from the repo:
-    pixi run -e search search search "Ca II triplet absorption" --term 'ca\\W*(ii)?\\W*triplet'
+    pixi run search search "Ca II triplet absorption" --term 'ca\\W*(ii)?\\W*triplet'
 Always single-quote bibcodes, queries and regexes: bibcodes contain '&'.
 """
 

@@ -16,6 +16,8 @@ reference/citation pull per neighbor -- a depth-2 expansion, not done here).
 
 Run directly:
     pixi run query --bibcode "2025A&A...702A..57H"
+    pixi run query --query 'abs:"Little Red Dot"'   # many seeds at once
+    pixi run query-lrd                              # shortcut for the LRD search above (first step of `pixi run all`)
 """
 
 from __future__ import annotations

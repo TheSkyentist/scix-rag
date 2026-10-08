@@ -89,7 +89,7 @@ Cite as `First author et al. (year), bibcode`, with `https://ui.adsabs.harvard.e
 ## When things go wrong
 
 - `cannot open ... Conflicting lock` / "database locked": a pipeline job (usually `pixi run embed`, which can take hours) holds the database. Tell the user and retry later. Do not try to work around it.
-- `search environment missing`: tell the user to run `pixi install -e search` in the arXivRAG repo. Do not run it yourself.
+- `embed environment missing`: tell the user to run `pixi install -e embed` in the arXivRAG repo. Do not run it yourself.
 - `no embeddings for Qwen3-Embedding-0.6B`, or a low-coverage warning: run `status`, report the numbers, and stop.
 - `--term regex rejected`: RE2 syntax error (usually a lookaround or backreference); rewrite with `|`, `\W*`, `\b`.
 - **Never run `embed`, `chunk`, `fetch`, `convert`, `query` or anything else that writes to the database or calls external APIs.** This tool is read-only.

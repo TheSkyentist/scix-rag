@@ -6,9 +6,9 @@ For each question it compares, on the same candidate lists:
   fused       top-k passages with the --term ranking fused in
   +listing    fused papers plus the first N "other papers matching the term"
   term-only   every paper whose text matches the term (what `grep` would list)
-and reports which gold papers each finds. Read-only; needs the `search` pixi env:
+and reports which gold papers each finds. Read-only; needs the `embed` pixi env:
 
-    .pixi/envs/search/bin/python -m evals.run_search_eval [--db PATH] [--k 8] [--list 25] [--case ID]
+    .pixi/envs/embed/bin/python -m evals.run_search_eval [--db PATH] [--k 8] [--list 25] [--case ID]
 """
 
 from __future__ import annotations
