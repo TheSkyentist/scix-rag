@@ -1,6 +1,6 @@
 [workspace]
 name = "scix-rag"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local astronomical paper RAG pipeline (ADS/SciX corpus, self-hosted embedding + retrieval)"
 channels = ["conda-forge"]
 platforms = [{ platform = "osx-arm64", macos = "14.5" }]

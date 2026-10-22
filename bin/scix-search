@@ -3,7 +3,14 @@
 # pixi environment's python directly: no pixi startup, no re-solve, and no task-shell
 # re-parsing of arguments (bibcodes contain '&'). Works from any directory.
 # Usage: scix-search {search|chunk|paper|status} ...   (see --help)
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Follow symlinks (the README links this script onto PATH) to find the real repo.
+SELF="$0"
+while [ -h "$SELF" ]; do
+    DIR="$(cd "$(dirname "$SELF")" && pwd)"
+    SELF="$(readlink "$SELF")"
+    case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 PY="$ROOT/.pixi/envs/embed/bin/python"
 if [ ! -x "$PY" ]; then
     echo "embed environment missing: run 'pixi install -e embed' in $ROOT" >&2
