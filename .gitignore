@@ -11,3 +11,6 @@ data/
 # lives only on disk: never commit it. Back it up outside git.
 *.duckdb
 *.duckdb.wal
+
+# marimo session cache
+__marimo__/

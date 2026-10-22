@@ -24,6 +24,7 @@ pixi run convert [--limit N]                     # convert data/html + data/pdf 
 pixi run convert 1965ApJS....9..321M.pdf         # convert specific file(s), bypassing convert_ignore.txt
 pixi run chunk [--limit N] [--rebuild]           # split data/markdown into the `chunks` table (--rebuild drops it and redoes every paper)
 pixi run -e embed embed [--limit N]       # embed pending chunks into `chunk_embeddings` with config.EMBED_MODEL (resumable; Ctrl-C loses ≤ one ~250K-token window)
+pixi run browse                                  # marimo notebook (notebooks/browse.py, own `browse` env) to page through every table and run SQL, corpus attached read-only
 bin/arxivrag-search {search|chunk|paper|grep|status} ...  # read-only literature search CLI (see "Search" below); also `pixi run search ...`
 ```
 

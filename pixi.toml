@@ -55,6 +55,14 @@ mlx-lm = ">=0.32.2,<0.33"
 embed = "python -m src.embed"
 search = "python -m src.search"
 
+[feature.browse.tasks]
+browse = "marimo edit notebooks/browse.py"
+
+[feature.browse.dependencies]
+marimo = ">=0.25.1,<0.26"
+polars = ">=2.0.0,<3"
+pyarrow = ">=25.0.0,<26"
+
 # Grow/refresh the corpus end to end: re-run the Little Red Dots seed query (`query-lrd`; cheap, only
 # bibcodes not already in the DB are fetched), then every stage in order. Each stage lives in its own
 # environment and pixi picks the one that defines the task. Re-running is safe: every stage resumes.
@@ -67,3 +75,4 @@ fetch = { features = ["fetch"] }
 extract = { features = ["extract"] }
 chunk = { features = ["chunk"] }
 embed = { features = ["embed"] }
+browse = { features = ["browse"] }

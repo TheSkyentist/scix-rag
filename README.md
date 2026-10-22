@@ -168,6 +168,20 @@ Most papers have an arXiv ID from the start. Some journal records, though, are n
 - It waits at least a second between papers on purpose, so a large corpus takes hours. It is safe to leave running and stop whenever.
 - The PDFs fetched from publishers are the publishers' copyrighted files. They are kept locally for your own research, so don't redistribute the contents of `data/`.
 
+## Browsing the database
+
+`browse` opens a [marimo](https://marimo.io) notebook in your browser, with the corpus attached read-only so nothing you do there can change it:
+
+```
+pixi run browse
+```
+
+- **Browse a table:** pick a table, the rows per page and a page number. Every table is available: `papers`, `citation_edges`, `chunks` and `chunk_embeddings`. Paging is fast even deep into the 345,000 chunks.
+- **Run your own SQL:** the last cell is a SQL editor. Start from the example (the 100 most-cited papers) and change it.
+- **Vectors:** the browser leaves out the `embedding` column of `chunk_embeddings`, because 1,024 numbers per row are unreadable. Your own SQL can still select it.
+- **Write lock:** like `search`, it can't open the database while `embed` or `chunk` is running.
+- **It's a plain Python file:** `notebooks/browse.py` is yours to edit or extend.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
