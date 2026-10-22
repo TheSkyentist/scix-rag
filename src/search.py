@@ -234,6 +234,12 @@ def _scope_sql(col: str, scope: Scope) -> tuple[str, list]:
     return sql, params
 
 
+def _quoted(patterns: list[str]) -> str:
+    """Patterns for the output headers, in plain quotes: repr() would double every
+    backslash, and a pattern copied back into a command would no longer match."""
+    return ' OR '.join(f"'{p}'" for p in patterns)
+
+
 def _combine_regexes(regexes: list[str], word: bool) -> str:
     """Join the --regex patterns (OR), optionally as whole words."""
     pattern = '|'.join(f'(?:{r})' for r in regexes)
@@ -469,7 +475,7 @@ def _semantic_search(
 
     quoted = ' | '.join(f'"{q}"' for q in queries)
     regex_label = (
-        f'   regex: {" OR ".join(repr(r) for r in regexes)} '
+        f'   regex: {_quoted(regexes)} '
         f'({"case-sensitive" if args.case else "case-insensitive"}{", whole words" if args.word else ""})'
         if regexes
         else ''
@@ -560,10 +566,10 @@ def _regex_search(
             ' (case-sensitive)' if args.case else '',
             f' since {args.since}' if args.since is not None else '',
             f' in {args.paper}' if args.paper else '',
-            f' also-mentioning {args.also!r}' if args.also else '',
+            f" also-mentioning '{args.also}'" if args.also else '',
         ]
     )
-    shown_regex = ' OR '.join(repr(r) for r in regexes)
+    shown_regex = _quoted(regexes)
     print(
         f'# regex: {shown_regex}{opts}: {len(rows)} chunks in {len(by_paper)} papers{capped}'
     )
