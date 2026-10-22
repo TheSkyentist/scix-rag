@@ -1,9 +1,9 @@
 [workspace]
-name = "arxivrag"
+name = "scix-rag"
 version = "0.1.0"
 description = "Local astronomical paper RAG pipeline (ADS/SciX corpus, self-hosted embedding + retrieval)"
 channels = ["conda-forge"]
-platforms = [{platform = "osx-arm64", macos = "14.5"}]
+platforms = [{ platform = "osx-arm64", macos = "14.5" }]
 
 [dependencies]
 python = ">=3.14.8,<3.15"
@@ -67,7 +67,13 @@ pyarrow = ">=25.0.0,<26"
 # bibcodes not already in the DB are fetched), then every stage in order. Each stage lives in its own
 # environment and pixi picks the one that defines the task. Re-running is safe: every stage resumes.
 [tasks]
-all = { description = "query-lrd -> fetch -> convert -> chunk -> embed", depends-on = ["query-lrd", "fetch", "convert", "chunk", "embed"] }
+all = { description = "query-lrd -> fetch -> convert -> chunk -> embed", depends-on = [
+    "query-lrd",
+    "fetch",
+    "convert",
+    "chunk",
+    "embed",
+] }
 
 [environments]
 query = { features = ["query"] }

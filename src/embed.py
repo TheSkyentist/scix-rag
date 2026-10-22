@@ -6,7 +6,7 @@ but were slower) and store the vectors in `chunk_embeddings` in papers.duckdb.
 Embedded text for a chunk = paper title + heading path (+ blank line) + body,
 where body is the chunk text, or for `kind='table'` just the caption + header
 row (chunk.table_embed_text). `kind='boilerplate'` chunks are never embedded (they
-stay reachable through `search grep`). Documents get no instruction prefix; queries (retrieval
+stay reachable through `search --regex`). Documents get no instruction prefix; queries (retrieval
 stage) use config.QUERY_INSTRUCTION (embed.format_query). The vector is the final
 hidden state of the appended <|endoftext|> token, L2-normalized, so cosine
 similarity is a dot product.

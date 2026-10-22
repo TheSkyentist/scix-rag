@@ -23,6 +23,8 @@ The pipeline has six stages. Each one resumes where it left off, so you can re-r
 - **[pixi](https://pixi.sh).** It manages every dependency. Each stage has its own environment, so the heavy PDF-conversion dependencies stay out of the lighter stages.
 - **[DuckDB](https://duckdb.org).** It stores the papers, the citation graph, the chunks and the vectors in one local file, and computes vector similarity inside the database. That means there is no separate vector-database server to run.
 - **An ADS API key.** It is free; you can create one in your [ADS/SciX](https://scixplorer.org/user/settings/token) account settings. Copy `.env.example` to `.env` and put the key in it, as described under [Stage 1](#stage-1-query).
+- **`scix-search` on your `PATH`**, to search from any directory or from an agent. Link the script into a folder on your `PATH`, for example `ln -s "$PWD/bin/scix-search" ~/.local/bin/`, and check that the folder really is on your `PATH`. See [Stage 6](#stage-6-search).
+- **The skill in your agent's skills folder**, to let an agent use the search. For Claude Code, `ln -s "$PWD/skills/scix-search" ~/.claude/skills/scix-search`. Other agents can read `skills/scix-search/SKILL.md` or have its contents pasted into their instructions file. See [Using it from an AI agent](#using-it-from-an-ai-agent).
 
 ## Disclaimers
 
@@ -211,7 +213,7 @@ Every chunk has a `kind`:
 | --- | --- |
 | `prose` | Ordinary text. |
 | `table` | One whole table with its caption. It is stored in full, but only the caption and header row are embedded. |
-| `boilerplate` | Acknowledgements, data availability, funding, author contributions, conflict-of-interest statements, and reference lists or author lists that leaked into the text. It stays searchable with `grep`, but it is not embedded by default. |
+| `boilerplate` | Acknowledgements, data availability, funding, author contributions, conflict-of-interest statements, and reference lists or author lists that leaked into the text. It stays searchable with `--regex`, but it is not embedded. |
 
 ### What gets stored
 
@@ -250,6 +252,82 @@ pixi run embed                           # embed everything that is pending
 - **Only changes are re-embedded:** a chunk is pending when it has no vector or when the hash of its text has changed. After `chunk --rebuild`, or after switching `EMBED_TITLE_PREFIX` in `config.py`, only the affected chunks are embedded again. Vectors for chunks that no longer exist are deleted at the start of a run.
 - **The database is locked while it runs:** `embed` keeps the database open for writing until it finishes, so `search` and `browse` cannot open it in the meantime. For the first big run, that means search is unavailable for many hours.
 - **Changing the model:** set `EMBED_MODEL` in `config.py` to another embedding model, and set `QUERY_INSTRUCTION` to the query format that model's model card asks for. The model must have a Qwen3 backbone and use last-token pooling, and `embed` stops with a clear message if it doesn't. Run `embed` again to embed every chunk with the new model. Search only uses the vectors of the configured model.
+
+## Stage 6: search
+
+`search` finds passages in the corpus and prints them with their ADS bibcodes. It is read-only and does retrieval only: no language model is involved, and nothing leaves your machine. You, or the AI agent you give it to, read the passages and write the answer. There is no server to run.
+
+```
+scix-search search --semantic 'how are black hole masses of little red dots estimated'
+```
+
+`scix-search` is the script `bin/scix-search`. To run it from any directory, link it onto your `PATH`, for example `ln -s "$PWD/bin/scix-search" ~/.local/bin/`. Always put queries, regexes and bibcodes in single quotes, because bibcodes contain `&` and regexes contain `\` and `|`. It runs in the `embed` environment, so run `pixi install -e embed` first if you haven't.
+
+### Two ways to search
+
+You can search by meaning, by text, or both. `search` takes `--semantic` for the first and `--regex` for the second, and needs at least one of them.
+
+**Semantic** (`--semantic`) finds passages by meaning, even when they use different words from your question. Give it one to four phrasings of the same question: a plain question, a version with the field's terminology and abbreviations, and a sentence the way a paper would state it. The results are fused, so a passage that scores well on several phrasings rises. Each call loads the embedding model, so it takes a few seconds.
+
+```
+scix-search search --semantic 'how are black hole masses of little red dots estimated' \
+                   --semantic 'virial black hole mass estimates for LRDs from broad H-alpha' \
+                   --semantic 'Black hole masses of LRDs are inferred from the width of the broad Halpha line'
+```
+
+**Literal** (`--regex`) finds every passage whose text matches a regular expression. It is exhaustive and unranked: it lists all the matches and the papers they belong to, and it also searches the boilerplate sections that semantic search leaves out. No model is loaded, so it is fast. Use it for complete lists of papers, to check an exact number, name or quote, and to test a regex before you combine it with a semantic query.
+
+```
+scix-search search --regex 'Ca II triplet' --since 2024
+scix-search search --regex 'CaT' --case --word --also 'little red dot'
+```
+
+The regex is case-insensitive and uses RE2 syntax (no lookahead or backreferences). Repeat `--regex` to allow several wordings, which are combined with OR. The text contains LaTeX, so allow `\W*` between words and use `\b` around short tokens. Special characters such as `.`, `(` and `+` need a backslash.
+
+### Combining them
+
+Pass both, and `search` runs the semantic search and also ranks the passages that match your regex. Matches rise in the ranking, are shown in bold in context, and every *other* paper that matches is listed afterwards. One call answers both "what do the papers say" and "which papers mention it", which suits named things: an object, a spectral line, an acronym, a number.
+
+```
+scix-search search --semantic 'which little red dots show Balmer absorption' \
+                   --regex 'balmer\W+(break|absorption)'
+```
+
+The header says how many chunks and papers match the regex. Zero means the search fell back to semantic only, and thousands means the regex is too generic to help. `--papers 25` sets how many other matching papers are listed (0 turns the list off). For conceptual questions, leave the regex out.
+
+### Options
+
+| Option | Effect |
+| --- | --- |
+| `--since 2024` | Only papers from that year on. |
+| `--paper BIBCODE` | Only this paper. |
+| `--also REGEX` | Only papers that also match this regex somewhere. |
+| `--case`, `--word` | Make `--regex` case-sensitive, or match whole words. |
+| `--k N` | How many passages to show. The default is 8 with `--semantic` and 30 with `--regex` alone. |
+| `--per-paper N` | At most this many passages from one paper. The default is 2 and 3. |
+| `--papers N` | How many matching papers to list. |
+| `--max-chars N` | How much of each passage to show. |
+
+### Reading the results
+
+Each passage starts with a line like `` `2026arXiv260922623W#1` arXiv:2609.22623 | 0.72 | q1,2 +regex | prose ``. That is the chunk's id (`bibcode#chunk number`), its arXiv ID, its cosine score, the phrasings that found it, `+regex` if it matches your regex, and its kind. Previews are clipped, and a `[+1860 chars]` marker says how much was cut. The score is only a ranking. A semantic search always returns something, so judge relevance by reading the passage, not by the number.
+
+To look closer:
+
+```
+scix-search chunk '2026arXiv260922623W#1' --context 1     # the full passage and its neighbours
+scix-search paper '2026arXiv260922623W'                   # metadata, abstract and an outline with chunk ranges
+scix-search paper '2026arXiv260922623W' --chunks 3-5      # read a section
+scix-search status                                         # what is indexed, embedded and where the corpus came from
+```
+
+### Using it from an AI agent
+
+The tool is built for agents. It only reads, it never writes to the database or calls an outside service, and its output is plain text that fits in a model's context. An agent runs the same commands as above, and `skills/scix-search/SKILL.md` teaches it how to use them well: when to add a `--regex`, how to write it, to expand a passage before quoting a number, to judge relevance by content, and to cite as `First author et al. (year), bibcode` with the ADS link. It also tells the agent never to run the stages that write to the database.
+
+- **Claude Code:** link the skill into your skills folder, `ln -s "$PWD/skills/scix-search" ~/.claude/skills/scix-search`, and make sure `scix-search` is on your `PATH`.
+- **Other agents:** point the agent at `skills/scix-search/SKILL.md` or paste its contents into your agent's instructions file, and make sure it can run `scix-search`.
+- **Describe your corpus:** the `description` at the top of `SKILL.md` is what tells an agent when to use the tool. It says to run `status` to see the corpus's scope, but you will get better results if you add your topics to it.
 
 ## Browsing the database
 

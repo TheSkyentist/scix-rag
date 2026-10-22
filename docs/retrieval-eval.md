@@ -2,6 +2,8 @@
 
 This page summarises a three-phase evaluation of the search stack. It decided the current embedding model (`harrier-oss-v1-0.6b`) and confirmed the chunking.
 
+The eval ran when the regex option of `search` was still called `--term`; it is `--regex` now, used together with `--semantic`, and the results below are unchanged.
+
 The eval code, question sets and full result tables live on the `retrieval-eval-2026-10` branch (`evals/`). They are tied to this particular corpus (bibcodes), so they are not on main.
 
 ## Eval sets

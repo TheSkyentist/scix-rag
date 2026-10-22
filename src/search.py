@@ -4,37 +4,42 @@ only: the calling agent (or you) does the reading and writing. Read-only on the
 database, and needs neither .env nor ADS access.
 
 Subcommands:
-    search  "q1" ["q2" ...]   semantic search (embeds the queries with the same
-                              embedding model as the chunks, scores in
-                              DuckDB, fuses the query variants by reciprocal rank).
-                              With --term REGEX (repeatable) the search is also run
-                              restricted to chunks whose text matches the regex, that
-                              ranking is fused in too, matches are shown as
-                              keyword-in-context snippets, and every other paper that
-                              matches is listed after the passages.
-    chunk   ID [ID ...]       one passage plus its neighbours (ID = BIBCODE#INDEX)
-    paper   BIBCODE           metadata + abstract + outline, or a section/the text
-    grep    PATTERN           literal (or --regex) text match over chunk text: the
-                              exhaustive, un-ranked "every paper that says X" tool,
-                              also for checking exact numbers and quotes
-    status                    what is indexed / embedded
+    search    find passages by meaning (--semantic QUERY, 1-4 phrasings, repeatable),
+              by text (--regex REGEX, repeatable = OR), or both. At least one is
+              required:
+                --semantic only   semantic search: the queries are embedded with the same
+                                  model as the chunks, scored in DuckDB, and the variants
+                                  fused by reciprocal rank.
+                --regex only      exhaustive and unranked: every chunk (boilerplate
+                                  included) whose text matches, with the papers by match
+                                  count. No model is loaded, so it starts fast.
+                both              semantic search fused with a ranking restricted to the
+                                  chunks that match the regex; matches are shown as
+                                  keyword-in-context snippets and every other matching
+                                  paper is listed after the passages.
+              Shared filters: --since YEAR, --paper BIBCODE, --also REGEX (the paper must
+              mention it somewhere), --case, --word.
+    chunk     ID [ID ...]   one passage plus its neighbours (ID = BIBCODE#INDEX)
+    paper     BIBCODE       metadata + abstract + outline, or a section/the text
+    status                  what is indexed / embedded, and what the corpus was seeded from
 
 Scoring happens inside DuckDB with the core list_inner_product() function on the
 stored FLOAT[] vectors (unit length, so inner product == cosine); vectors are
-never pulled into Python. Without --term the scoring query touches only
-chunk_embeddings; with it, one regex scan of `chunks` picks the matching chunk ids
-and their scores for all query variants are computed in a single pass. The big
-`chunks` / `papers` tables are otherwise read only for the final hits.
-Only `search` imports mlx/transformers, so the other subcommands start fast.
+never pulled into Python. With --semantic alone the scoring query touches only
+chunk_embeddings; with --regex too, one regex scan of `chunks` picks the matching
+chunk ids and their scores for all query variants are computed in a single pass.
+The big `chunks` / `papers` tables are otherwise read only for the final hits.
+Only a --semantic search imports mlx/transformers, so everything else starts fast.
 
-Run via the wrapper (bin/arxivrag-search) or, from the repo:
-    pixi run search search "Ca II triplet absorption" --term 'ca\\W*(ii)?\\W*triplet'
+Run via the wrapper (bin/scix-search) or, from the repo:
+    pixi run search search --semantic 'Ca II triplet absorption' --regex 'ca\\W*(ii)?\\W*triplet'
 Always single-quote bibcodes, queries and regexes: bibcodes contain '&'.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import re
 import sys
@@ -52,7 +57,7 @@ MAX_QUERIES = 4
 COVERAGE_WARN = 0.99
 GREP_ROW_CAP = 20_000  # bound memory on very common terms
 TERM_TOO_GENERIC = (
-    5_000  # a --term matching this many chunks no longer sharpens the ranking
+    5_000  # a --regex matching this many chunks no longer sharpens the ranking
 )
 DEFAULT_LIST_PAPERS = (
     25  # `search`: other term-matching papers listed after the passages
@@ -69,7 +74,15 @@ class Hit(NamedTuple):
     rrf: float
     score: float  # best cosine across the query variants
     queries: tuple[int, ...]  # 1-based variants that retrieved it
-    term: bool = False  # chunk text matches --term
+    term: bool = False  # chunk text matches --regex
+
+
+class Scope(NamedTuple):
+    """Filters shared by every search mode."""
+
+    since: int | None = None
+    paper: str | None = None
+    also: str | None = None  # the paper must also mention this regex somewhere
 
 
 class TermScan(NamedTuple):
@@ -166,7 +179,8 @@ def _papers_by_bibcode(
         f'FROM papers WHERE bibcode IN ({_in_list(len(bibcodes))})',
         bibcodes,
     ).fetchall()
-    return {r[0]: r for r in rows}
+    # ADS titles carry HTML entities (&lt;, &amp;, ...)
+    return {r[0]: (*r[:2], html.unescape(r[2] or ''), *r[3:]) for r in rows}
 
 
 def _paper_header(bibcode: str, papers: dict[str, tuple]) -> str:
@@ -184,6 +198,55 @@ def _re2_escape(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- search
+
+_RE2_HINT = (
+    '(DuckDB uses RE2 syntax: no lookahead/lookbehind or backreferences. Use `|` for '
+    'variants, `\\W*` between words, `\\b` for word boundaries.)'
+)
+
+
+def _prepare_scope(con: duckdb.DuckDBPyConnection, scope: Scope) -> None:
+    """--also is a paper-level co-occurrence test over all chunk text; run it once into a
+    temp table (allowed on a read-only database) so every scan can reuse it."""
+    if not scope.also:
+        return
+    try:
+        con.execute(
+            'CREATE OR REPLACE TEMP TABLE also_papers AS SELECT DISTINCT bibcode FROM chunks '
+            "WHERE regexp_matches(text, ?, 'i')",
+            [scope.also],
+        )
+    except duckdb.Error as e:
+        _die(f'--also regex rejected: {str(e).splitlines()[0]}\n{_RE2_HINT}')
+
+
+def _scope_sql(col: str, scope: Scope) -> tuple[str, list]:
+    """AND-clauses (and their params) that keep only papers inside the scope."""
+    sql, params = '', []
+    if scope.since is not None:
+        sql += f' AND {col} IN (SELECT bibcode FROM papers WHERE year >= ?)'
+        params.append(scope.since)
+    if scope.paper:
+        sql += f' AND {col} = ?'
+        params.append(scope.paper)
+    if scope.also:
+        sql += f' AND {col} IN (SELECT bibcode FROM also_papers)'
+    return sql, params
+
+
+def _combine_regexes(regexes: list[str], word: bool) -> str:
+    """Join the --regex patterns (OR), optionally as whole words."""
+    pattern = '|'.join(f'(?:{r})' for r in regexes)
+    return rf'\b(?:{pattern})\b' if word else pattern
+
+
+def _compile_regex(pattern: str, case: bool) -> re.Pattern | None:
+    """Python regex used only to highlight snippets (None if Python rejects what RE2
+    accepted)."""
+    try:
+        return re.compile(pattern, 0 if case else re.IGNORECASE)
+    except re.error:
+        return None
 
 
 def _embed_queries(queries: list[str]) -> list[list[float]]:
@@ -204,7 +267,7 @@ def _top_chunks(
     model_id: str,
     qvec: list[float],
     n: int,
-    since: int | None,
+    scope: Scope,
 ) -> list[tuple[str, int, float]]:
     """Top-n (bibcode, chunk_index, cosine) by a full scan of chunk_embeddings.
     Filters sit inside the scan so they narrow the candidates *before* the top-n."""
@@ -213,23 +276,10 @@ def _top_chunks(
         'FROM chunk_embeddings e WHERE e.model = ?'
     )
     params: list = [qvec, model_id]
-    if since is not None:
-        sql += ' AND e.bibcode IN (SELECT bibcode FROM papers WHERE year >= ?)'
-        params.append(since)
-    sql += ' ORDER BY score DESC, e.bibcode, e.chunk_index LIMIT ?'
-    params.append(n)
+    scope_sql, scope_params = _scope_sql('e.bibcode', scope)
+    sql += scope_sql + ' ORDER BY score DESC, e.bibcode, e.chunk_index LIMIT ?'
+    params += scope_params + [n]
     return con.execute(sql, params).fetchall()
-
-
-def _compile_terms(terms: list[str], case: bool) -> tuple[str, re.Pattern | None]:
-    """Combine --term regexes (OR). Returns (pattern for DuckDB/RE2, compiled Python
-    regex for snippets -- None if Python rejects what RE2 accepted)."""
-    pattern = '|'.join(f'(?:{t})' for t in terms)
-    try:
-        rx = re.compile(pattern, 0 if case else re.IGNORECASE)
-    except re.error:
-        rx = None
-    return pattern, rx
 
 
 def _term_scan(
@@ -238,40 +288,29 @@ def _term_scan(
     qvecs: list[list[float]],
     pattern: str,
     case: bool,
-    since: int | None,
+    scope: Scope,
     n: int,
 ) -> TermScan:
     """One regex scan of chunk text (+ heading path) picks the matching chunks; their
     cosine to every query variant is computed in the same pass, so the cost is one
     scan however many variants there are. Boilerplate chunks (acknowledgements,
     author lists, ...) are excluded: they are not embedded and are noise for a
-    'which papers say X' question (use `grep` to include them)."""
-    since_sql = (
-        ' AND c.bibcode IN (SELECT bibcode FROM papers WHERE year >= ?)'
-        if since is not None
-        else ''
-    )
+    'which papers say X' question (a --regex search without --semantic includes them)."""
+    scope_sql, scope_params = _scope_sql('c.bibcode', scope)
     scores = ', '.join('list_inner_product(e.embedding, ?::FLOAT[])' for _ in qvecs)
     sql = (
         "WITH m AS (SELECT c.bibcode, c.chunk_index FROM chunks c WHERE c.kind <> 'boilerplate' "
-        f"AND regexp_matches(coalesce(c.heading_path, '') || ' ' || c.text, ?, ?){since_sql}) "
+        f"AND regexp_matches(coalesce(c.heading_path, '') || ' ' || c.text, ?, ?){scope_sql}) "
         f'SELECT m.bibcode, m.chunk_index, {scores} FROM m LEFT JOIN chunk_embeddings e '
         'ON e.bibcode = m.bibcode AND e.chunk_index = m.chunk_index AND e.model = ?'
     )
     params: list = (
-        [pattern, 'c' if case else 'i']
-        + ([since] if since is not None else [])
-        + list(qvecs)
-        + [model_id]
+        [pattern, 'c' if case else 'i'] + scope_params + list(qvecs) + [model_id]
     )
     try:
         rows = con.execute(sql, params).fetchall()
     except duckdb.Error as e:
-        _die(
-            f'--term regex rejected: {str(e).splitlines()[0]}\n'
-            '(DuckDB uses RE2 syntax: no lookahead/lookbehind or backreferences. Use `|` for variants, '
-            '`\\W*` between words, `\\b` for word boundaries.)'
-        )
+        _die(f'--regex rejected: {str(e).splitlines()[0]}\n{_RE2_HINT}')
     ranked = []
     for qi in range(len(qvecs)):
         scored = [(r[0], r[1], r[2 + qi]) for r in rows if r[2 + qi] is not None]
@@ -287,7 +326,7 @@ def _fuse(
     term_ranked: list[list[tuple[str, int, float]]] | None = None,
     term_weight: float | None = None,
 ) -> list[Hit]:
-    """Reciprocal-rank fusion across the query variants -- and, with --term, across the
+    """Reciprocal-rank fusion across the query variants -- and, with --regex, across the
     term-restricted rankings of the same variants -- then the per-paper cap. A passage
     that ranks well both ways is found twice and rises."""
     tw = TERM_WEIGHT if term_weight is None else term_weight
@@ -363,15 +402,15 @@ def _preview(text: str, rx: re.Pattern | None, max_chars: int) -> str:
     return body + f' [+{max(len(text) - shown, 0)} chars]'
 
 
-def cmd_search(args: argparse.Namespace) -> int:
+def _semantic_search(
+    args: argparse.Namespace,
+    con: duckdb.DuckDBPyConnection,
+    queries: list[str],
+    regexes: list[str],
+    scope: Scope,
+) -> int:
     ph: _Phases = args.phases
-    if not 1 <= len(args.queries) <= MAX_QUERIES:
-        _die(
-            f'give 1-{MAX_QUERIES} queries (variants of the same question), got {len(args.queries)}'
-        )
-    terms = [t for t in (args.term or []) if t]
     n_list = max(0, min(args.papers, MAX_LIST_PAPERS))
-    con = _connect(args.db)
     model_id = config.EMBED_MODEL
     models = _models(con)
     if model_id not in models:
@@ -390,21 +429,20 @@ def cmd_search(args: argparse.Namespace) -> int:
         )
     ph.mark('open')
 
-    qvecs = _embed_queries(args.queries)
+    qvecs = _embed_queries(queries)
     ph.mark('embed queries (incl. import + model load)')
 
     n_candidates = max(100, 10 * args.k)
-    ranked = [_top_chunks(con, model_id, qv, n_candidates, args.since) for qv in qvecs]
+    ranked = [_top_chunks(con, model_id, qv, n_candidates, scope) for qv in qvecs]
     ph.mark(f'score x{len(qvecs)}')
 
     scan: TermScan | None = None
     pattern = rx = None
-    if terms:
-        pattern, rx = _compile_terms(terms, args.case)
-        scan = _term_scan(
-            con, model_id, qvecs, pattern, args.case, args.since, n_candidates
-        )
-        ph.mark('term scan')
+    if regexes:
+        pattern = _combine_regexes(regexes, args.word)
+        rx = _compile_regex(pattern, args.case)
+        scan = _term_scan(con, model_id, qvecs, pattern, args.case, scope, n_candidates)
+        ph.mark('regex scan')
 
     hits = _fuse(ranked, args.k, args.per_paper, scan.ranked if scan else None)
     bibcodes = list(dict.fromkeys(h.bibcode for h in hits))
@@ -429,28 +467,29 @@ def cmd_search(args: argparse.Namespace) -> int:
     chunks = {(r[0], r[1]): r for r in rows if (r[0], r[1]) in wanted}
     ph.mark('fetch hits')
 
-    quoted = ' | '.join(f'"{q}"' for q in args.queries)
-    term_label = (
-        f'   term: {" OR ".join(repr(t) for t in terms)} ({"case-sensitive" if args.case else "case-insensitive"})'
-        if terms
+    quoted = ' | '.join(f'"{q}"' for q in queries)
+    regex_label = (
+        f'   regex: {" OR ".join(repr(r) for r in regexes)} '
+        f'({"case-sensitive" if args.case else "case-insensitive"}{", whole words" if args.word else ""})'
+        if regexes
         else ''
     )
     print(
-        f'# search: {quoted}{term_label}   ({len(hits)} passages, {len(bibcodes)} papers; score = best cosine across variants)'
+        f'# search: {quoted}{regex_label}   ({len(hits)} passages, {len(bibcodes)} papers; score = best cosine across variants)'
     )
     if scan:
         print(
-            f'# term matched {scan.n_chunks} chunks in {len(scan.per_paper)} papers (non-boilerplate text + headings)'
+            f'# regex matched {scan.n_chunks} chunks in {len(scan.per_paper)} papers (non-boilerplate text + headings)'
         )
         if scan.n_chunks == 0:
             print(
-                'warning: --term matched nothing, so these results are semantic-only. Loosen the regex: allow '
-                'spelling variants with `|`, put `\\W*` between words, drop \\b; test it with '
-                "`grep --regex 'PATTERN'`."
+                'warning: --regex matched nothing, so these results are semantic-only. Loosen the regex: allow '
+                'spelling variants with `|`, put `\\W*` between words, drop \\b; test it on its own with '
+                "`search --regex 'PATTERN'`."
             )
         elif scan.n_chunks > TERM_TOO_GENERIC:
             print(
-                f'warning: --term matches {scan.n_chunks} chunks; that is too generic to sharpen the ranking. Use a more specific regex.'
+                f'warning: --regex matches {scan.n_chunks} chunks; that is too generic to sharpen the ranking. Use a more specific regex.'
             )
     for bibcode in bibcodes:
         print(f'\n{_paper_header(bibcode, papers)}')
@@ -462,15 +501,15 @@ def cmd_search(args: argparse.Namespace) -> int:
             _, _, heading_path, section_heading, kind, text = row
             tag = f' arXiv:{arxiv}' if arxiv else ''
             via = ','.join(map(str, h.queries))
-            via = f'q{via}' if via else 'term-only'
-            via += ' +term' if h.term and h.queries else ''
+            via = f'q{via}' if via else 'regex-only'
+            via += ' +regex' if h.term and h.queries else ''
             print(f'- `{h.bibcode}#{h.idx}`{tag} | {h.score:.2f} | {via} | {kind}')
             print(f'  {heading_path or section_heading or "(no heading)"}')
             print(_preview(text, rx if h.term else None, args.max_chars))
     if scan and listed:
         more = len(extra) - len(listed)
         print(
-            f'\n## Other papers matching the term ({len(extra)}; listing {len(listed)} by number of matching chunks)'
+            f'\n## Other papers matching the regex ({len(extra)}; listing {len(listed)} by number of matching chunks)'
         )
         for b, n in listed:
             p = papers.get(b)
@@ -482,13 +521,100 @@ def cmd_search(args: argparse.Namespace) -> int:
                 print(f'- `{b}` | {n} chunks')
         if more > 0:
             print(
-                f'({more} more not listed: raise --papers (max {MAX_LIST_PAPERS}), narrow the term, or use `grep`)'
+                f'({more} more not listed: raise --papers (max {MAX_LIST_PAPERS}), narrow the regex, or run it without --semantic)'
             )
     if hits:
         print(
             f"\n---\nExpand: chunk '{hits[0].bibcode}#{hits[0].idx}' --context 1 | outline: paper '{hits[0].bibcode}'"
         )
     return 0
+
+
+def _regex_search(
+    args: argparse.Namespace,
+    con: duckdb.DuckDBPyConnection,
+    regexes: list[str],
+    scope: Scope,
+) -> int:
+    """Exhaustive, unranked: every chunk (boilerplate included) whose text matches."""
+    pattern = _combine_regexes(regexes, args.word)
+    rx = _compile_regex(pattern, args.case)
+    sql = 'SELECT bibcode, chunk_index, kind, text FROM chunks WHERE regexp_matches(text, ?, ?)'
+    scope_sql, scope_params = _scope_sql('bibcode', scope)
+    sql += scope_sql + ' ORDER BY bibcode, chunk_index LIMIT ?'
+    params = [pattern, 'c' if args.case else 'i'] + scope_params + [GREP_ROW_CAP]
+    try:
+        rows = con.execute(sql, params).fetchall()
+    except duckdb.Error as e:
+        _die(f'--regex rejected: {str(e).splitlines()[0]}\n{_RE2_HINT}')
+
+    by_paper: dict[str, list[tuple]] = {}
+    for r in rows:
+        by_paper.setdefault(r[0], []).append(r)
+    ordered = sorted(by_paper, key=lambda b: (-len(by_paper[b]), b))
+    papers = _papers_by_bibcode(con, ordered[: max(args.papers, 1)])
+    capped = ' (capped: more matches exist)' if len(rows) >= GREP_ROW_CAP else ''
+    opts = ''.join(
+        [
+            ' (whole word)' if args.word else '',
+            ' (case-sensitive)' if args.case else '',
+            f' since {args.since}' if args.since is not None else '',
+            f' in {args.paper}' if args.paper else '',
+            f' also-mentioning {args.also!r}' if args.also else '',
+        ]
+    )
+    shown_regex = ' OR '.join(repr(r) for r in regexes)
+    print(
+        f'# regex: {shown_regex}{opts}: {len(rows)} chunks in {len(by_paper)} papers{capped}'
+    )
+    if not rows:
+        return 0
+    print('\n## Papers by number of matching chunks')
+    for b in ordered[: args.papers]:
+        p = papers.get(b)
+        print(
+            f'- `{b}` | {len(by_paper[b])} chunks | {(p[2] if p else "?")} ({p[5] if p else "?"})'
+        )
+    if len(ordered) > args.papers:
+        print(f'({len(ordered) - args.papers} more papers not listed; raise --papers)')
+    print('\n## Matches')
+    shown = 0
+    for b in ordered:
+        for _, idx, kind, text in by_paper[b][: args.per_paper]:
+            if shown >= args.k:
+                break
+            print(f'- `{b}#{idx}` | {kind}: {_snippet(text, rx)}')
+            shown += 1
+    if len(rows) > shown:
+        print(
+            f'\n({len(rows) - shown} more matching chunks not shown; raise --k/--per-paper or narrow with --paper)'
+        )
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    queries = [q for q in (args.semantic or []) if q.strip()]
+    regexes = [r for r in (args.regex or []) if r]
+    if not queries and not regexes:
+        _die('give --semantic QUERY and/or --regex REGEX (see `search --help`)')
+    if len(queries) > MAX_QUERIES:
+        _die(
+            f'give at most {MAX_QUERIES} --semantic queries (variants of the same question), got {len(queries)}'
+        )
+    # Defaults differ by mode: a ranked top-k with a few passages per paper, or an
+    # exhaustive list with more snippets and a longer paper summary.
+    if args.k is None:
+        args.k = 8 if queries else 30
+    if args.per_paper is None:
+        args.per_paper = 2 if queries else 3
+    if args.papers is None:
+        args.papers = DEFAULT_LIST_PAPERS if queries else 50
+    scope = Scope(args.since, args.paper, args.also)
+    con = _connect(args.db)
+    _prepare_scope(con, scope)
+    if queries:
+        return _semantic_search(args, con, queries, regexes, scope)
+    return _regex_search(args, con, regexes, scope)
 
 
 # --------------------------------------------------------------------------- chunk / paper
@@ -598,7 +724,7 @@ def cmd_paper(args: argparse.Namespace) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------- grep / status
+# --------------------------------------------------------------------------- status
 
 
 def _snippet(text: str, rx: re.Pattern | None, width: int = 110) -> str:
@@ -614,85 +740,21 @@ def _snippet(text: str, rx: re.Pattern | None, width: int = 110) -> str:
     )
 
 
-def cmd_grep(args: argparse.Namespace) -> int:
-    con = _connect(args.db)
-    flag = 'c' if args.case else 'i'
-    if args.regex or args.word:
-        pat = args.pattern if args.regex else _re2_escape(args.pattern)
-        if args.word:
-            pat = rf'\b(?:{pat})\b'
-        cond, params = 'regexp_matches(text, ?, ?)', [pat, flag]
-    else:
-        pat = re.escape(args.pattern)
-        if args.case:
-            cond, params = 'contains(text, ?)', [args.pattern]
-        else:
-            cond, params = 'contains(lower(text), ?)', [args.pattern.lower()]
-    try:
-        rx = re.compile(pat, 0 if args.case else re.IGNORECASE)
-    except re.error:
-        rx = None
-    sql = f'SELECT bibcode, chunk_index, kind, text FROM chunks WHERE {cond}'
-    if args.paper:
-        sql += ' AND bibcode = ?'
-        params.append(args.paper)
-    if args.since is not None:
-        sql += ' AND bibcode IN (SELECT bibcode FROM papers WHERE year >= ?)'
-        params.append(args.since)
-    if args.also:
-        # paper-level co-occurrence: the paper must mention this somewhere (any chunk)
-        sql += " AND bibcode IN (SELECT bibcode FROM chunks WHERE regexp_matches(text, ?, 'i'))"
-        params.append(args.also)
-    sql += ' ORDER BY bibcode, chunk_index LIMIT ?'
-    params.append(GREP_ROW_CAP)
-    try:
-        rows = con.execute(sql, params).fetchall()
-    except duckdb.Error as e:
-        _die(
-            f'pattern rejected: {str(e).splitlines()[0]} (DuckDB uses RE2 syntax: no lookarounds/backreferences)'
-        )
-
-    by_paper: dict[str, list[tuple]] = {}
-    for r in rows:
-        by_paper.setdefault(r[0], []).append(r)
-    ordered = sorted(by_paper, key=lambda b: (-len(by_paper[b]), b))
-    papers = _papers_by_bibcode(con, ordered[: max(args.papers, 1)])
-    capped = ' (capped: more matches exist)' if len(rows) >= GREP_ROW_CAP else ''
-    opts = ''.join(
-        [
-            ' (regex)' if args.regex else '',
-            ' (whole word)' if args.word else '',
-            ' (case-sensitive)' if args.case else '',
-            f' since {args.since}' if args.since is not None else '',
-            f' also-mentioning {args.also!r}' if args.also else '',
-        ]
-    )
+def _print_origins(con: duckdb.DuckDBPyConnection) -> None:
+    """How papers entered the corpus (papers.query_source), which also tells what it was
+    seeded from: `search:<query>` papers matched a seed query, `expansion_of_search:<query>`
+    ones are references/citations of those."""
+    rows = con.execute(
+        """SELECT CASE WHEN query_source LIKE 'search:%' OR query_source LIKE 'expansion_of_search:%'
+                       THEN query_source ELSE split_part(query_source, ':', 1) END AS origin,
+                  count(*)
+           FROM papers GROUP BY 1 ORDER BY 2 DESC, 1"""
+    ).fetchall()
     print(
-        f'# grep: {args.pattern!r}{opts}: {len(rows)} chunks in {len(by_paper)} papers{capped}'
+        'papers by origin (search:<query> = seed query match, expansion_of_search:<query> = its references/citations):'
     )
-    if not rows:
-        return 0
-    print('\n## Papers by number of matching chunks')
-    for b in ordered[: args.papers]:
-        p = papers.get(b)
-        print(
-            f'- `{b}` | {len(by_paper[b])} chunks | {(p[2] if p else "?")} ({p[5] if p else "?"})'
-        )
-    if len(ordered) > args.papers:
-        print(f'({len(ordered) - args.papers} more papers not listed; raise --papers)')
-    print('\n## Matches')
-    shown = 0
-    for b in ordered:
-        for _, idx, kind, text in by_paper[b][: args.per_paper]:
-            if shown >= args.limit:
-                break
-            print(f'- `{b}#{idx}` | {kind}: {_snippet(text, rx)}')
-            shown += 1
-    if len(rows) > shown:
-        print(
-            f'\n({len(rows) - shown} more matching chunks not shown; raise --limit/--per-paper or narrow with --paper)'
-        )
-    return 0
+    for origin, n in rows:
+        print(f'  {n:>6}  {origin or "(unknown)"}')
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -700,6 +762,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     q = lambda sql: con.execute(sql).fetchall()
     print(f'database: {args.db} ({args.db.stat().st_size / 1e9:.2f} GB)')
     print(f'papers: {q("SELECT count(*) FROM papers")[0][0]}')
+    _print_origins(con)
     chunk_rows = q(
         'SELECT kind, count(*), count(DISTINCT bibcode), sum(n_tokens) FROM chunks GROUP BY 1 ORDER BY 1'
     )
@@ -748,54 +811,82 @@ def _parser() -> argparse.ArgumentParser:
         '--db',
         type=Path,
         default=config.DB_PATH,
-        help='database file (default: papers.duckdb)',
+        help='database file (default: data/papers.duckdb)',
     )
     common.add_argument(
         '--timing', action='store_true', help='print per-phase timings to stderr'
     )
 
     p = argparse.ArgumentParser(
-        prog='arxivrag-search', description='Search the local astro-ph literature index'
+        prog='scix-search',
+        description='Search the local literature index built by scix-rag',
     )
     sub = p.add_subparsers(dest='cmd', required=True)
 
     s = sub.add_parser(
         'search',
         parents=[common],
-        help='semantic search (1-4 query variants), optionally fused with a regex --term',
+        help='find passages by meaning (--semantic), by text (--regex), or both',
     )
     s.add_argument(
-        'queries',
-        nargs='+',
-        help='variants of one question; each is embedded and results are fused',
+        '--semantic',
+        action='append',
+        metavar='QUERY',
+        help='a question or topic, searched by meaning. Repeat up to 4 times with different '
+        'phrasings of the same question (a plain question, a terminology variant, a declarative '
+        'sentence); the results are fused.',
     )
     s.add_argument(
-        '--term',
+        '--regex',
         action='append',
         metavar='REGEX',
-        help='regex (case-insensitive; repeatable = OR) that passages should contain. Use for any named line, '
-        "object, number or acronym, with spelling variants, e.g. 'ca\\W*(ii)?\\W*triplet'. Fuses a term-restricted "
-        'ranking with the semantic one, shows matches in context, and lists other matching papers.',
+        help='regular expression (RE2, case-insensitive; repeatable = OR) the passage text must '
+        "match, for any named line, object, number or acronym, e.g. 'ca\\W*(ii)?\\W*triplet'. "
+        'Alone: every matching passage, unranked, boilerplate included. With --semantic: ranks '
+        'matching passages up, shows the matches in context and lists other matching papers.',
     )
     s.add_argument(
         '--case',
         action='store_true',
-        help="make --term case-sensitive (e.g. 'CaT' without matching 'cat')",
+        help="make --regex case-sensitive (e.g. 'CaT' without matching 'cat')",
     )
-    s.add_argument('--k', type=int, default=8, help='max passages returned')
-    s.add_argument('--per-paper', type=int, default=2, help='max passages per paper')
+    s.add_argument(
+        '--word',
+        action='store_true',
+        help='match --regex as whole words (wraps it in \\b...\\b)',
+    )
+    s.add_argument(
+        '--since', type=int, default=None, help='only papers from this year on'
+    )
+    s.add_argument('--paper', default=None, help='only this paper (a bibcode)')
+    s.add_argument(
+        '--also',
+        metavar='REGEX',
+        default=None,
+        help="only papers that also mention this regex somewhere (e.g. 'little red dot')",
+    )
+    s.add_argument(
+        '--k',
+        type=int,
+        default=None,
+        help='max passages shown (default 8 with --semantic, 30 with --regex alone)',
+    )
+    s.add_argument(
+        '--per-paper',
+        type=int,
+        default=None,
+        help='max passages per paper (default 2 with --semantic, 3 with --regex alone)',
+    )
     s.add_argument(
         '--max-chars', type=int, default=1200, help='preview length per passage'
     )
     s.add_argument(
         '--papers',
         type=int,
-        default=DEFAULT_LIST_PAPERS,
-        help=f'with --term: how many other matching papers to list after the passages (default {DEFAULT_LIST_PAPERS}, '
-        f'max {MAX_LIST_PAPERS}, 0 = none). Raise it when you expect many.',
-    )
-    s.add_argument(
-        '--since', type=int, default=None, help='only papers from this year on'
+        default=None,
+        help=f'how many matching papers to list (with --semantic and --regex: the other matching '
+        f'papers, default {DEFAULT_LIST_PAPERS}, max {MAX_LIST_PAPERS}, 0 = none; with --regex '
+        'alone: the papers summary, default 50). Raise it when you expect many.',
     )
     s.set_defaults(func=cmd_search)
 
@@ -825,40 +916,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     d.add_argument('--max-chars', type=int, default=20000)
     d.set_defaults(func=cmd_paper)
-
-    g = sub.add_parser(
-        'grep',
-        parents=[common],
-        help='exhaustive literal/regex text match over chunk text',
-    )
-    g.add_argument('pattern')
-    g.add_argument(
-        '--regex', action='store_true', help='treat PATTERN as a regular expression'
-    )
-    g.add_argument(
-        '--word',
-        action='store_true',
-        help='whole-word match (wraps PATTERN in \\b...\\b)',
-    )
-    g.add_argument(
-        '--case', action='store_true', help='case-sensitive (default: insensitive)'
-    )
-    g.add_argument(
-        '--since', type=int, default=None, help='only papers from this year on'
-    )
-    g.add_argument(
-        '--also',
-        metavar='REGEX',
-        default=None,
-        help="keep only papers that also mention this regex somewhere (e.g. 'little red dot')",
-    )
-    g.add_argument('--paper', default=None, help='restrict to one bibcode')
-    g.add_argument(
-        '--papers', type=int, default=50, help='papers listed in the summary'
-    )
-    g.add_argument('--limit', type=int, default=30, help='max snippets shown')
-    g.add_argument('--per-paper', type=int, default=3, help='max snippets per paper')
-    g.set_defaults(func=cmd_grep)
 
     t = sub.add_parser('status', parents=[common], help='what is indexed and embedded')
     t.set_defaults(func=cmd_status)
