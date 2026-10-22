@@ -32,6 +32,19 @@ The pipeline has six stages. Each one resumes where it left off, so you can re-r
 2. **Not every paper can be fetched.** Papers with no arXiv preprint need a publisher or ADS-hosted PDF, and many don't have one. Some of those are behind a paywall or block automated downloads. Not every PDF converts cleanly either. Papers that can't be fetched or converted are left out of the index, so a search finding nothing is not evidence that no paper says it.
 3. **This is not a replacement for reading the papers.** Retrieval tells you where to look. It does not make you an expert in the literature, and it can miss relevant passages. Read the papers and do your own work.
 
+## Quick start
+
+```
+git clone https://github.com/TheSkyentist/scix-rag.git && cd scix-rag
+cp .env.example .env                                        # then put your ADS API key in .env
+pixi run query --query 'abs:"your topic"' --dry-run         # preview how big the corpus would be
+pixi run query --query 'abs:"your topic"'                   # add the papers to the database
+pixi run update                                             # fetch, convert, chunk and embed them
+bin/scix-search search --semantic 'a question about your topic'
+```
+
+`pixi run update` runs the four stages after `query` in order, and stops at the first one that fails. Every stage resumes where it left off, so you can stop it and run it again. The first run of each stage downloads its environment, which is large for `convert` because of the PDF tools, and `embed` downloads the embedding model. To try the pipeline cheaply first, seed it from a single paper, `pixi run query --bibcode '2025A&A...702A..57H'`, and run `update` on that. The stages are described one by one below, together with their options, and [Requirements](#requirements) says how to put `scix-search` on your `PATH`.
+
 ## Stage 1: query
 
 `query` is the only stage that talks to the ADS API, and the only one that needs your key. Put it in a `.env` file at the repo root (gitignored):

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-A local, self-hosted retrieval-augmented-generation pipeline over a citation-graph-selected subset of astro-ph papers (currently seeded from "Little Red Dots" literature via ADS/SciX). The corpus is built by walking the citation graph, then each paper's full text is fetched and cleaned into Markdown. Embedding/retrieval is the active next step (see "Planned next stage" below) — everything through Markdown conversion is built and running in production. The whole pipeline runs locally, by hand, whenever you want to grow the corpus: `pixi run query ...` to seed, then `pixi run all` (= `query-lrd` → `fetch` → `convert` → `chunk` → `embed`).
+A local, self-hosted retrieval-augmented-generation pipeline over a citation-graph-selected subset of astronomy papers from ADS/SciX (the corpus here was seeded from the "Little Red Dots" literature, but nothing in the code is specific to it). The corpus is built by walking the citation graph from seed papers, then each paper's full text is fetched and cleaned into Markdown, chunked, embedded and searched, all locally. The whole pipeline runs by hand whenever you want to grow the corpus: `pixi run query ...` to add papers, then `pixi run update` (= `fetch` → `convert` → `chunk` → `embed`).
 
 This project previously targeted GWDG's hosted Arcana RAG service for embedding/indexing; that integration has been dropped in favor of a fully local pipeline (own embedding model, own vector search) after Arcana's indexing step destructively wiped a previously-working index on a large batch timeout. Don't resurrect `arcana_upload.py`/`ARCANA_*` config or re-introduce an upload-to-Arcana step.
 
@@ -13,8 +13,7 @@ This project previously targeted GWDG's hosted Arcana RAG service for embedding/
 Environment/task management is [pixi](https://pixi.sh); each pipeline stage lives in its own pixi feature/environment (separate dependency sets — e.g. the PDF path pulls in `torch` via MinerU, which the HTML-only stages don't need).
 
 ```
-pixi run all                                     # query-lrd -> fetch -> convert -> chunk -> embed in order (stops at the first failing stage; each stage resumes on re-run)
-pixi run query-lrd [--references] [--citations]  # shortcut for `query --query 'abs:"Little Red Dot"'`; the first step of `all`. As a pixi task it takes no flags inside `all`, so `all` adds only newly matching seeds, no references/citations (expansion became opt-in)
+pixi run update                                  # fetch -> convert -> chunk -> embed in order (stops at the first failing stage; each stage resumes on re-run); `query` is run separately
 pixi run query --bibcode "2025A&A...702A..57H" [--references] [--citations]  # seeds only by default; --bibcode is repeatable, --bibcode-file FILE reads one per line; --dry-run previews without writing; ends with the canonicalize pass (--no-canonicalize skips it)
 pixi run query --query 'abs:"Little Red Dots"'   # seed from an ADS search instead (many seeds at once)
 pixi run fetch [--limit N] [--dry-run] [--retry-failed]  # fetch raw HTML/PDF for every paper in the DB with no text on disk (seed or neighbor alike); --dry-run reports pending papers by route and the ignore-list skips without touching anything; ends with a count summary
@@ -97,7 +96,3 @@ A read-only CLI plus an agent skill (`skills/scix-search/SKILL.md`), meant for i
 - `chunk --rebuild` tags leaked front matter headings (authors, affiliations, ORCIDs, keywords) as `boilerplate`; `embed` drops the vectors of chunks that became boilerplate (this model only) before counting what is pending, so a re-tag needs only `chunk --rebuild` then `embed`. `search status` reports not-yet-dropped ones.
 - The DB is opened `read_only=True`; while `embed`/`chunk` hold the write lock it fails with a one-line message (exit 2). Run `embed` after `chunk --rebuild`, or embeddings may be stale/orphaned (`status` counts orphans).
 - The skill's source is `skills/scix-search/SKILL.md` (Claude Code: symlink it into `~/.claude/skills/scix-search`; its `description` is what triggers use, so keep it describing the corpus). It is deliberately generic: the corpus scope comes from `status`, and it calls `scix-search` from `PATH`.
-
-## Known-stale docs
-
-`README.md` still describes the original GWDG-Arcana-based plan (one-file-per-paper upload, `arcana_ingest.py`, old module names like `fetch_html.py`) and predates the current pipeline — don't treat it as authoritative for current architecture.
