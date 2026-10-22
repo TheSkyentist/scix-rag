@@ -38,13 +38,20 @@ MAX_CHUNK_TOKENS = 1024
 MAX_TABLE_EMBED_TOKENS = 256  # tables are stored whole but only caption + header row get embedded
 
 # Embedding stage (src/embed.py)
-EMBED_MODEL_SIZE = '0.6B'  # Qwen3-Embedding-{0.6B,4B}; bf16 only (8-/4-bit were slower, not faster)
+# Embedding models: id (stored as chunk_embeddings.model) -> (HF repo, text between "Query:" and the
+# query). Any Qwen3-backbone, last-token-pooled embedder loads the same way (src/embed.py), e.g.
+# 'Qwen3-Embedding-0.6B': ('Qwen/Qwen3-Embedding-0.6B', ''); bf16 only (8-/4-bit were slower, not
+# faster). EMBED_MODEL is what `embed` writes, `search` reads and `chunk` takes its tokenizer from.
+EMBED_MODELS = {
+    'harrier-oss-v1-0.6b': ('microsoft/harrier-oss-v1-0.6b', ' '),
+}
+EMBED_MODEL = 'harrier-oss-v1-0.6b'  # chosen by a retrieval eval in Oct 2026; see CLAUDE.md
 MAX_EMBED_TOKENS = 8192  # chunks longer than this are truncated (model context is 32K)
 EMBED_BATCH_TOKENS = 16384  # max padded tokens (items x longest) per forward pass
 EMBED_MAX_BATCH = 16
 EMBED_COMMIT_TOKENS = 250_000  # ~tokens embedded between DB commits; bounds what Ctrl-C can lose
 EMBED_TITLE_PREFIX = True  # prepend the paper title to each chunk's embedded text (open question)
-# Qwen3-Embedding wants queries (not documents) as "Instruct: {task}\nQuery:{query}".
+# Queries (not documents) are formatted "Instruct: {task}\nQuery:{sep}{query}" (sep per EMBED_MODELS).
 QUERY_INSTRUCTION = (
     'Given a question or topic from astrophysics research, retrieve passages '
     'from scientific papers that answer or discuss it'

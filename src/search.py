@@ -5,7 +5,7 @@ database, and needs neither .env nor ADS access.
 
 Subcommands:
     search  "q1" ["q2" ...]   semantic search (embeds the queries with the same
-                              Qwen3-Embedding model as the chunks, scores in
+                              embedding model as the chunks, scores in
                               DuckDB, fuses the query variants by reciprocal rank).
                               With --term REGEX (repeatable) the search is also run
                               restricted to chunks whose text matches the regex, that
@@ -169,11 +169,11 @@ def _re2_escape(s: str) -> str:
 # --------------------------------------------------------------------------- search
 
 
-def _embed_queries(queries: list[str], size: str) -> list[list[float]]:
+def _embed_queries(queries: list[str], model: str) -> list[list[float]]:
     from .embed import embed_texts, format_query, load_embedder  # lazy: pulls in mlx/transformers
 
-    model, tokenizer = load_embedder(size, offline_first=True)
-    return embed_texts(model, tokenizer, [format_query(q) for q in queries]).vectors.tolist()
+    net, tokenizer = load_embedder(model, offline_first=True)
+    return embed_texts(net, tokenizer, [format_query(q, model) for q in queries]).vectors.tolist()
 
 
 def _top_chunks(
@@ -313,7 +313,7 @@ def cmd_search(args: argparse.Namespace) -> int:
     terms = [t for t in (args.term or []) if t]
     n_list = max(0, min(args.papers, MAX_LIST_PAPERS))
     con = _connect(args.db)
-    model_id = f"Qwen3-Embedding-{args.model_size}"
+    model_id = args.model
     models = _models(con)
     if model_id not in models:
         have = ", ".join(f"{m} ({n} chunks)" for m, n in models.items()) or "none"
@@ -327,7 +327,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         )
     ph.mark("open")
 
-    qvecs = _embed_queries(args.queries, args.model_size)
+    qvecs = _embed_queries(args.queries, model_id)
     ph.mark("embed queries (incl. import + model load)")
 
     n_candidates = max(100, 10 * args.k)
@@ -632,7 +632,7 @@ def _parser() -> argparse.ArgumentParser:
         f"max {MAX_LIST_PAPERS}, 0 = none). Raise it when you expect many.",
     )
     s.add_argument("--since", type=int, default=None, help="only papers from this year on")
-    s.add_argument("--model-size", default=config.EMBED_MODEL_SIZE, choices=["0.6B", "4B"])
+    s.add_argument("--model", default=config.EMBED_MODEL, choices=list(config.EMBED_MODELS), help="embedding model (default config.EMBED_MODEL)")
     s.set_defaults(func=cmd_search)
 
     c = sub.add_parser("chunk", parents=[common], help="show passage(s) with neighbours")

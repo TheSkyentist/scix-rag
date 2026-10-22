@@ -33,9 +33,9 @@ to flatten lists into one "•"-joined line), then at sentence boundaries, and
 the pieces are re-packed up to the budget. A single sentence that alone
 exceeds the budget still becomes its own oversized chunk.
 
-Token counts use Qwen3-Embedding-4B's own tokenizer (shared by the 0.6B
-model), not a proxy -- loading just the tokenizer needs no GPU and no model
-weights.
+Token counts use the embedding model's own tokenizer (config.EMBED_MODEL;
+harrier-oss-v1 ships the Qwen3 tokenizer), not a proxy -- loading just the
+tokenizer needs no GPU and no model weights.
 
 A paper is skipped if it already has any rows in `chunks`. Re-chunking after
 a logic change means `--rebuild`, which drops the whole table first (and so
@@ -57,7 +57,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 import config
 
-_TOKENIZER_NAME = "Qwen/Qwen3-Embedding-4B"
+_TOKENIZER_NAME = config.EMBED_MODELS[config.EMBED_MODEL][0]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (

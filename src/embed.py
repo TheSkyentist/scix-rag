@@ -1,13 +1,14 @@
 """
-Embed every chunk in `chunks` with Qwen3-Embedding (run locally with MLX, bf16
--- quantization saved memory but was slower, see CLAUDE.md) and store the
-vectors in `chunk_embeddings` in papers.duckdb.
+Embed every chunk in `chunks` with config.EMBED_MODEL (harrier-oss-v1-0.6b, a Qwen3
+backbone; run locally with MLX, bf16 -- quantization saved
+memory but was slower, see CLAUDE.md) and store the vectors in `chunk_embeddings` in
+papers.duckdb.
 
 Embedded text for a chunk = paper title + heading path (+ blank line) + body,
 where body is the chunk text, or for `kind='table'` just the caption + header
 row (chunk.table_embed_text). `kind='boilerplate'` chunks are skipped unless
 --include-boilerplate. Documents get no instruction prefix; queries (retrieval
-stage) use Qwen3's "Instruct: ...\\nQuery: ..." format. The vector is the final
+stage) use the "Instruct: ...\\nQuery: ..." format (embed.format_query). The vector is the final
 hidden state of the appended <|endoftext|> token, L2-normalized, so cosine
 similarity is a dot product.
 
@@ -29,7 +30,7 @@ loses at most the window in flight, and re-running resumes.
 Run directly (from the `embed` environment):
     pixi run embed
     pixi run embed --limit 200            # smoke-test on the first 200 pending chunks
-    pixi run embed --model-size 4B        # the 4B model (~10x slower; vectors are 2560-d)
+    pixi run embed --model harrier-oss-v1-0.6b   # another model from config.EMBED_MODELS (own rows)
 """
 
 from __future__ import annotations
@@ -83,8 +84,8 @@ def _weights_complete(path: Path) -> bool:
     return any(path.glob("*.safetensors"))
 
 
-def _model_dir(size: str, offline_first: bool) -> Path:
-    repo = f"Qwen/Qwen3-Embedding-{size}"
+def _model_dir(model: str, offline_first: bool) -> Path:
+    repo = config.EMBED_MODELS[model][0]
     if offline_first:
         # snapshot_download normally checks the Hub for a newer revision on
         # every call; a query CLI shouldn't need the network once cached.
@@ -97,20 +98,20 @@ def _model_dir(size: str, offline_first: bool) -> Path:
     return Path(snapshot_download(repo, allow_patterns=_HF_PATTERNS))
 
 
-def load_embedder(size: str, offline_first: bool = False) -> tuple[Model, PreTrainedTokenizerBase]:
-    path = _model_dir(size, offline_first)
-    model = Model(ModelArgs.from_dict(json.loads((path / "config.json").read_text())))
+def load_embedder(model: str = config.EMBED_MODEL, offline_first: bool = False) -> tuple[Model, PreTrainedTokenizerBase]:
+    path = _model_dir(model, offline_first)
+    net = Model(ModelArgs.from_dict(json.loads((path / "config.json").read_text())))
     weights: dict[str, mx.array] = {}
     for f in sorted(path.glob("*.safetensors")):
         weights.update(mx.load(str(f)))
     # The HF embedding checkpoints omit the "model." key prefix mlx_lm's
     # causal-LM wrapper expects (it is a plain Qwen3 backbone, no lm_head).
-    model.load_weights([
+    net.load_weights([
         (k if k.startswith(("model.", "lm_head")) else f"model.{k}", v)
         for k, v in weights.items()
     ])
-    mx.eval(model.parameters())
-    return model, AutoTokenizer.from_pretrained(str(path))
+    mx.eval(net.parameters())
+    return net, AutoTokenizer.from_pretrained(str(path))
 
 
 def embedded_text(
@@ -124,10 +125,10 @@ def embedded_text(
     return f"{prefix}\n\n{body}" if prefix else body
 
 
-def format_query(query: str) -> str:
-    """Counterpart of embedded_text() for retrieval: queries carry Qwen3's
-    task instruction, documents don't."""
-    return f"Instruct: {config.QUERY_INSTRUCTION}\nQuery:{query}"
+def format_query(query: str, model: str = config.EMBED_MODEL) -> str:
+    """Counterpart of embedded_text() for retrieval: queries carry the task
+    instruction, documents don't. Qwen3 wants "Query:{q}", harrier "Query: {q}"."""
+    return f"Instruct: {config.QUERY_INSTRUCTION}\nQuery:{config.EMBED_MODELS[model][1]}{query}"
 
 
 def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
@@ -215,14 +216,14 @@ def _pending(
                 yield bibcode, idx, et, h
 
 
-def embed(limit: int | None = None, size: str = config.EMBED_MODEL_SIZE, include_boilerplate: bool = False) -> None:
+def embed(limit: int | None = None, model: str = config.EMBED_MODEL, include_boilerplate: bool = False) -> None:
     con = duckdb.connect(str(config.DB_PATH))
     try:
         columns = {r[1] for r in con.execute("PRAGMA table_info('chunks')").fetchall()}
         if not {"kind", "heading_path"} <= columns:
             raise SystemExit("chunks table is missing or has the old schema; run `pixi run chunk --rebuild` first")
         con.execute(_SCHEMA)
-        model_id = f"Qwen3-Embedding-{size}"
+        model_id = model
 
         orphans = con.execute(
             """DELETE FROM chunk_embeddings e WHERE NOT EXISTS
@@ -257,7 +258,7 @@ def embed(limit: int | None = None, size: str = config.EMBED_MODEL_SIZE, include
         if not target:
             return
 
-        model, tokenizer = load_embedder(size)
+        net, tokenizer = load_embedder(model_id)
 
         n_done = n_tokens = n_truncated = 0
         t0 = time.perf_counter()
@@ -268,7 +269,7 @@ def embed(limit: int | None = None, size: str = config.EMBED_MODEL_SIZE, include
             nonlocal window, window_est, n_done, n_tokens, n_truncated
             if not window:
                 return
-            emb = embed_texts(model, tokenizer, [w[2] for w in window])
+            emb = embed_texts(net, tokenizer, [w[2] for w in window])
             con.begin()
             try:
                 _insert_vectors(con, model_id, [(b, i, et, h) for b, i, et, h in window], emb.vectors)
@@ -304,10 +305,10 @@ def embed(limit: int | None = None, size: str = config.EMBED_MODEL_SIZE, include
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Embed chunks with Qwen3-Embedding (MLX) into chunk_embeddings")
+    parser = argparse.ArgumentParser(description="Embed chunks (MLX) into chunk_embeddings")
     parser.add_argument("--limit", type=int, default=None, help="Stop after embedding N pending chunks")
-    parser.add_argument("--model-size", default=config.EMBED_MODEL_SIZE, choices=["0.6B", "4B"], help="Qwen3-Embedding size")
+    parser.add_argument("--model", default=config.EMBED_MODEL, choices=list(config.EMBED_MODELS), help="embedding model")
     parser.add_argument("--include-boilerplate", action="store_true", help="Also embed kind='boilerplate' chunks")
     args = parser.parse_args()
 
-    embed(limit=args.limit, size=args.model_size, include_boilerplate=args.include_boilerplate)
+    embed(limit=args.limit, model=args.model, include_boilerplate=args.include_boilerplate)
