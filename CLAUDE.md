@@ -17,7 +17,7 @@ pixi run all                                     # query-lrd -> fetch -> convert
 pixi run query-lrd [--references] [--citations]  # shortcut for `query --query 'abs:"Little Red Dot"'`; the first step of `all`. As a pixi task it takes no flags inside `all`, so `all` adds only newly matching seeds, no references/citations (expansion became opt-in)
 pixi run query --bibcode "2025A&A...702A..57H" [--references] [--citations]  # seeds only by default; --bibcode is repeatable, --bibcode-file FILE reads one per line; --dry-run previews without writing; ends with the canonicalize pass (--no-canonicalize skips it)
 pixi run query --query 'abs:"Little Red Dots"'   # seed from an ADS search instead (many seeds at once)
-pixi run fetch [--limit N]                       # fetch raw HTML/PDF for papers not yet converted
+pixi run fetch [--limit N] [--dry-run] [--retry-failed]  # fetch raw HTML/PDF for every paper in the DB with no text on disk (seed or neighbor alike); --dry-run reports pending papers by route and the ignore-list skips without touching anything; ends with a count summary
 pixi run fetch --refresh [--since YEAR] [--dry-run]  # first re-query ADS for papers with no arxiv_id (preprints merged since ingest) and canonicalize them (below); gained ids switch stem, old files dropped once the arXiv copy lands, `chunk` re-chunks them
 pixi run canonicalize [--apply] [--since YEAR]   # one row per paper under ADS's canonical bibcode: dry run by default (looks up every paper on ADS, ~2 min)
 pixi run convert [--limit N]                     # convert data/html + data/pdf into data/markdown

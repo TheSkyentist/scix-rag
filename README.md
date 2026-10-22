@@ -99,6 +99,48 @@ The request count includes the clean-up pass at the end (see `--no-canonicalize`
 - Each paper records how it got in (`query_source`): as a seed, or as a reference or citation of one. The first entry is kept when a later query finds the same paper.
 - ADS allows about 5000 requests per day per key. A large expansion uses a few hundred. If you hit the limit, the run stops with a message and you can re-run it the next day.
 
+## Stage 2: fetch
+
+`fetch` downloads the full text of every paper in the database that doesn't have it yet. It makes no difference whether a paper came in as a seed or as a reference or citation of one. It only downloads. Cleaning the text into Markdown is the next stage. Where the text comes from depends on the paper:
+
+- **Papers with an arXiv ID:** the arXiv HTML version, then the ar5iv HTML version. A page only counts if it converts to a reasonable amount of text. If neither does, `fetch` falls back to the arXiv PDF.
+- **Papers without an arXiv ID:** a PDF that ADS links to, tried in this order: the publisher's PDF, the PDF ADS hosts itself, the preprint PDF. These are fetched through ADS's link gateway.
+
+The raw files land in `data/html/` and `data/pdf/`.
+
+```
+pixi run fetch --dry-run                     # how many papers are pending, and by which route, without downloading
+pixi run fetch --limit 20                    # try the first 20 pending papers, as a smoke test
+pixi run fetch                               # everything pending
+pixi run fetch --retry-failed                # also retry papers a previous run gave up on
+pixi run fetch --refresh --dry-run           # report what a refresh would change (below)
+pixi run fetch --refresh                     # refresh the arXiv links first, then fetch
+pixi run fetch --refresh --since 2015        # refresh only the papers published in 2015 or later
+```
+
+`--dry-run` also reports how many papers the ignore list would skip (see below). At the end of a real run `fetch` prints a summary: how many papers were fetched as HTML, how many as PDF, how many had nothing fetchable, and how many hit a temporary error and will be tried again next time.
+
+### Papers that can't be fetched
+
+When every source for a paper definitively answers "no", `fetch` writes the paper to `data/fetch_ignore.txt` by itself, one line per paper with the reason:
+
+```
+2019ApJ...000..000X  # no ADS PDF source (esources: none)
+2301.00000  # no arXiv HTML/PDF
+```
+
+Later runs skip every paper on that list, so the same dead ends aren't retried every time. To try a paper again, delete its line, or run `pixi run fetch --retry-failed` to retry the whole list. Network errors, timeouts and rate limits are never written to the list, so those papers are retried on the next run. Like everything under `data/`, the list is gitignored, so back it up along with the database.
+
+### Refreshing arXiv links
+
+A paper that was only a journal record when you ran `query` often gets linked to its arXiv preprint later. `--refresh` asks ADS again about the papers that have no arXiv ID, and updates those that gained one, so they are fetched from arXiv's HTML instead of a PDF. Papers ADS has re-keyed are merged into one row, the same clean-up `query` ends with. `--since YEAR` limits the refresh to recent papers, and `--dry-run` reports what would change without writing anything.
+
+### Good to know
+
+- Fetching is resumable. A paper counts as done once a file for it exists under `data/`, so you can stop a run with Ctrl-C and start it again.
+- It waits at least a second between papers on purpose, so a large corpus takes hours. It is safe to leave running and stop whenever.
+- The PDFs fetched from publishers are the publishers' copyrighted files. They are kept locally for your own research, so don't redistribute the contents of `data/`.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
