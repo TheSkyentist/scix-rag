@@ -11,13 +11,13 @@ HTML_DIR = DATA_DIR / 'html'
 MARKDOWN_DIR = DATA_DIR / 'markdown'
 PDF_DIR = DATA_DIR / 'pdf'
 
-# Hand-maintained list of raw filenames the bulk `convert` skips. Lives at
-# the repo root (not under data/) so it's committed, unlike data/pdf/.
-CONVERT_IGNORE_PATH = ROOT / 'convert_ignore.txt'
+# Hand-maintained list of raw filenames the bulk `convert` skips. Lives under
+# data/ (gitignored); back it up along with papers.duckdb.
+CONVERT_IGNORE_PATH = DATA_DIR / 'convert_ignore.txt'
 
 # Papers `fetch` found nothing fetchable for (appended automatically; one
 # stem per line with a `# reason`). Skipped on later runs unless --retry-failed.
-FETCH_IGNORE_PATH = ROOT / 'fetch_ignore.txt'
+FETCH_IGNORE_PATH = DATA_DIR / 'fetch_ignore.txt'
 
 DATA_DIR.mkdir(exist_ok=True)
 HTML_DIR.mkdir(exist_ok=True)

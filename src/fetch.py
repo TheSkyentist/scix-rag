@@ -27,7 +27,7 @@ unrecoverable papers on every run (no permanent "gave up" marker) -- a
 deliberate simplicity-over-efficiency tradeoff.
 
 Papers where every source answered definitively "no" are appended to
-`fetch_ignore.txt` (repo root, committed; same format as convert_ignore.txt)
+`data/fetch_ignore.txt` (gitignored; same format as convert_ignore.txt)
 and skipped on later runs, so they aren't re-tried every time. Network
 errors, timeouts, 429s and 5xx are *not* recorded -- those retry next run.
 Delete a line (or pass --retry-failed) to try a paper again.

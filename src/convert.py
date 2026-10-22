@@ -24,7 +24,7 @@ individual image-only pages (observed directly in this corpus), and
 per-page auto-detection handles that correctly where a document-level
 split wouldn't.
 
-Files named in `convert_ignore.txt` (repo root; one filename per line,
+Files named in `data/convert_ignore.txt` (one filename per line,
 `#` comments) are skipped by the bulk run -- for PDFs that reliably time
 out or fail in MinerU. The bulk run appends to it itself (`name  # reason`)
 whenever a file times out (MinerU's 1800 s limit), makes `mineru-kit` exit

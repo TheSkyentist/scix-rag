@@ -3,11 +3,9 @@
 __pycache__/
 *.pyc
 
-# Ephemeral fetch/convert caches -- regenerated fresh each run from
-# papers.duckdb's pending status columns, not meant to persist.
-data/html/
-data/markdown/
-data/pdf/
+# All local pipeline state: raw/converted files, the ignore lists, and the DB.
+# Nothing under data/ is committed; back it up outside git.
+data/
 
 # The corpus database (papers, citation edges, chunks, embeddings) is multi-GB and
 # lives only on disk: never commit it. Back it up outside git.
