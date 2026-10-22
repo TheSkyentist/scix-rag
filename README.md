@@ -158,6 +158,10 @@ When every source for a paper definitively answers "no", `fetch` writes the pape
 
 Later runs skip every paper on that list, so the same dead ends aren't retried every time. To try a paper again, delete its line, or run `pixi run fetch --retry-failed` to retry the whole list. Network errors, timeouts and rate limits are never written to the list, so those papers are retried on the next run. Like everything under `data/`, the list is gitignored, so back it up along with the database.
 
+### Adding a paper by hand
+
+If a paper can't be fetched but you have its PDF, from your library, your institution or the publisher, put it in `data/pdf/` yourself. Name it after the paper's stem: its arXiv ID when it has one, otherwise its bibcode, for example `1953JChPh..21.1087M.pdf`. The lines in `fetch_ignore.txt` show the right name for each paper. `fetch` sees the file and skips the paper, and `convert` turns the PDF into Markdown like any downloaded one. The paper must already be in the database, so add it with `pixi run query --bibcode` first if it isn't. After that, run `convert` and the later stages as usual.
+
 ### Refreshing arXiv links
 
 Most papers have an arXiv ID from the start. Some journal records, though, are not yet linked to their preprint when you run `query`, and ADS may add the link later. `--refresh` asks ADS again about the papers that have no arXiv ID, and updates those that gained one, so they are fetched from arXiv's HTML instead of a PDF. Papers ADS has re-keyed are merged into one row, the same [clean-up](#keeping-one-row-per-paper) `query` ends with. `--since YEAR` limits the refresh to recent papers, and `--dry-run` reports what would change without writing anything.
@@ -167,6 +171,33 @@ Most papers have an arXiv ID from the start. Some journal records, though, are n
 - Fetching is resumable. A paper counts as done once a file for it exists under `data/`, so you can stop a run with Ctrl-C and start it again.
 - It waits at least a second between papers on purpose, so a large corpus takes hours. It is safe to leave running and stop whenever.
 - The PDFs fetched from publishers are the publishers' copyrighted files. They are kept locally for your own research, so don't redistribute the contents of `data/`.
+
+## Stage 3: convert
+
+`convert` turns the raw files `fetch` downloaded into Markdown, one file per paper in `data/markdown/`, named by the paper's arXiv ID or, without one, its bibcode. Once a paper's Markdown is written the raw file is deleted. It only looks at the files in `data/html/` and `data/pdf/` and never touches the database. It runs in its own pixi environment, because the PDF tools are large.
+
+- **HTML** (from arXiv and ar5iv) is cleaned by plain Python code, with no machine learning, so it is fast and reliable. The Markdown keeps the headings, paragraphs, lists and tables (as text), and writes math as LaTeX. Figures are kept as captions only, because images are never stored. The bibliography is dropped, since the citation links are in the database.
+- **PDF** is converted by [MinerU](https://github.com/opendatalab/MinerU), which runs locally, with OCR on pages that are only images. It is the slowest part of the whole pipeline: an HTML paper takes moments, while a PDF can take up to its 30-minute limit, so a corpus with many PDF-only papers can spend a long time here. It is also less reliable: math, tables and scanned older papers can come out imperfect. Afterwards the reference list, embedded image data and ADS page stamps are removed. MinerU is a separate tool, so check its license terms for your use.
+
+```
+pixi run convert --dry-run                        # how many files are waiting, without converting
+pixi run convert --limit 5                        # try the first 5 of each type, as a smoke test
+pixi run convert                                  # everything waiting
+pixi run convert 1965ApJS....9..321M.pdf          # convert specific files, even if they are on the ignore list
+pixi run convert --retry-failed                   # also retry every file on the ignore list
+```
+
+At the end of a run it prints how many files were converted and how many failed.
+
+### Papers that can't be converted
+
+A file that converts to almost no text (under 500 characters), makes MinerU time out, or makes it exit with an error is left where it is, and `convert` adds its filename and the reason to `data/convert_ignore.txt` by itself:
+
+```
+1965ApJS....9..321M.pdf  # MinerU timeout (1800s)
+```
+
+Later runs skip the files on that list, so a PDF that always times out doesn't cost 30 minutes every time. Naming a file on the command line converts it anyway and never records anything, and `--retry-failed` retries the whole list. Other errors, such as a disk problem, are only printed and are tried again on the next run. The list is gitignored like the rest of `data/`, so back it up with the database. Unlike `fetch_ignore.txt`, it holds filenames with their extension.
 
 ## Browsing the database
 

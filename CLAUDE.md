@@ -20,7 +20,7 @@ pixi run query --query 'abs:"Little Red Dots"'   # seed from an ADS search inste
 pixi run fetch [--limit N] [--dry-run] [--retry-failed]  # fetch raw HTML/PDF for every paper in the DB with no text on disk (seed or neighbor alike); --dry-run reports pending papers by route and the ignore-list skips without touching anything; ends with a count summary
 pixi run fetch --refresh [--since YEAR] [--dry-run]  # first re-query ADS for papers with no arxiv_id (preprints merged since ingest) and canonicalize them (below); gained ids switch stem, old files dropped once the arXiv copy lands, `chunk` re-chunks them
 pixi run canonicalize [--apply] [--since YEAR]   # one row per paper under ADS's canonical bibcode: dry run by default (looks up every paper on ADS, ~2 min)
-pixi run convert [--limit N]                     # convert data/html + data/pdf into data/markdown
+pixi run convert [--limit N] [--dry-run]         # convert data/html + data/pdf into data/markdown (own `convert` env, formerly `extract`); --dry-run counts what is waiting; ends with a converted/failed summary
 pixi run convert 1965ApJS....9..321M.pdf         # convert specific file(s), bypassing convert_ignore.txt
 pixi run chunk [--limit N] [--rebuild]           # split data/markdown into the `chunks` table (--rebuild drops it and redoes every paper)
 pixi run -e embed embed [--limit N]       # embed pending chunks into `chunk_embeddings` with config.EMBED_MODEL (resumable; Ctrl-C loses ≤ one ~250K-token window)

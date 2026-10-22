@@ -30,15 +30,15 @@ lxml = ">=6.1.3,<7"
 [feature.fetch.tasks]
 fetch = "python -m src.fetch"
 
-[feature.extract.dependencies]
+[feature.convert.dependencies]
 beautifulsoup4 = ">=4.15.0,<5"
 lxml = ">=6.1.3,<7"
 
-[feature.extract.pypi-dependencies]
+[feature.convert.pypi-dependencies]
 mineru = { version = ">=4.0.10, <5", extras = ["torch"] }
 opencv-python-headless = ">=5.0.0.93, <6"
 
-[feature.extract.tasks]
+[feature.convert.tasks]
 convert = "python -m src.convert"
 
 [feature.chunk.dependencies]
@@ -72,7 +72,7 @@ all = { description = "query-lrd -> fetch -> convert -> chunk -> embed", depends
 [environments]
 query = { features = ["query"] }
 fetch = { features = ["fetch"] }
-extract = { features = ["extract"] }
+convert = { features = ["convert"] }
 chunk = { features = ["chunk"] }
 embed = { features = ["embed"] }
 browse = { features = ["browse"] }
