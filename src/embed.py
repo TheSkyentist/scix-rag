@@ -1,6 +1,6 @@
 """
-Embed every chunk in `chunks` with config.EMBED_MODEL (harrier-oss-v1-0.6b, a Qwen3
-backbone; run locally with MLX, bf16 -- quantization saved
+Embed every chunk in `chunks` with config.EMBED_MODEL (a Qwen3-backbone embedder,
+currently harrier-oss-v1-0.6b; run locally with MLX, bf16 -- quantization saved
 memory but was slower, see CLAUDE.md) and store the vectors in `chunk_embeddings` in
 papers.duckdb.
 
@@ -8,7 +8,7 @@ Embedded text for a chunk = paper title + heading path (+ blank line) + body,
 where body is the chunk text, or for `kind='table'` just the caption + header
 row (chunk.table_embed_text). `kind='boilerplate'` chunks are skipped unless
 --include-boilerplate. Documents get no instruction prefix; queries (retrieval
-stage) use the "Instruct: ...\\nQuery: ..." format (embed.format_query). The vector is the final
+stage) use config.QUERY_INSTRUCTION (embed.format_query). The vector is the final
 hidden state of the appended <|endoftext|> token, L2-normalized, so cosine
 similarity is a dot product.
 
@@ -30,7 +30,6 @@ loses at most the window in flight, and re-running resumes.
 Run directly (from the `embed` environment):
     pixi run embed
     pixi run embed --limit 200            # smoke-test on the first 200 pending chunks
-    pixi run embed --model harrier-oss-v1-0.6b   # another model from config.EMBED_MODELS (own rows)
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
 );
 """
 
-_EOT = "<|endoftext|>"
+_EOT = '<|endoftext|>'
 _INSERT_ROWS_PER_STATEMENT = 200
 
 
@@ -73,62 +72,93 @@ class Embedded(NamedTuple):
     n_truncated: int
 
 
-_HF_PATTERNS = ["*.json", "*.safetensors", "*.txt"]
+_HF_PATTERNS = ['*.json', '*.safetensors', '*.txt']
 
 
 def _weights_complete(path: Path) -> bool:
-    index = path / "model.safetensors.index.json"
+    index = path / 'model.safetensors.index.json'
     if index.exists():  # sharded checkpoint: every listed shard must be present
-        shards = set(json.loads(index.read_text())["weight_map"].values())
+        shards = set(json.loads(index.read_text())['weight_map'].values())
         return all((path / s).exists() for s in shards)
-    return any(path.glob("*.safetensors"))
+    return any(path.glob('*.safetensors'))
 
 
-def _model_dir(model: str, offline_first: bool) -> Path:
-    repo = config.EMBED_MODELS[model][0]
+def _model_dir(offline_first: bool) -> Path:
+    repo = config.EMBED_MODEL
     if offline_first:
         # snapshot_download normally checks the Hub for a newer revision on
         # every call; a query CLI shouldn't need the network once cached.
         try:
-            path = Path(snapshot_download(repo, allow_patterns=_HF_PATTERNS, local_files_only=True))
-            if (path / "config.json").exists() and _weights_complete(path):
+            path = Path(
+                snapshot_download(
+                    repo, allow_patterns=_HF_PATTERNS, local_files_only=True
+                )
+            )
+            if (path / 'config.json').exists() and _weights_complete(path):
                 return path
         except Exception:  # not cached (or partial): fall through to the normal path
             pass
     return Path(snapshot_download(repo, allow_patterns=_HF_PATTERNS))
 
 
-def load_embedder(model: str = config.EMBED_MODEL, offline_first: bool = False) -> tuple[Model, PreTrainedTokenizerBase]:
-    path = _model_dir(model, offline_first)
-    net = Model(ModelArgs.from_dict(json.loads((path / "config.json").read_text())))
+def _check_supported(path: Path) -> None:
+    """Stop early on a model this loader would load wrongly: it builds a Qwen3 network
+    and pools the last token."""
+    model_type = json.loads((path / 'config.json').read_text()).get('model_type')
+    if model_type != 'qwen3':
+        raise SystemExit(
+            f'{config.EMBED_MODEL} is a {model_type!r} model; only Qwen3-backbone '
+            'embedding models are supported (see EMBED_MODEL in config.py)'
+        )
+    pooling = path / '1_Pooling' / 'config.json'
+    if pooling.exists() and not json.loads(pooling.read_text()).get(
+        'pooling_mode_lasttoken'
+    ):
+        raise SystemExit(
+            f'{config.EMBED_MODEL} does not use last-token pooling, which is the only '
+            'pooling supported (see EMBED_MODEL in config.py)'
+        )
+
+
+def load_embedder(offline_first: bool = False) -> tuple[Model, PreTrainedTokenizerBase]:
+    path = _model_dir(offline_first)
+    _check_supported(path)
+    net = Model(ModelArgs.from_dict(json.loads((path / 'config.json').read_text())))
     weights: dict[str, mx.array] = {}
-    for f in sorted(path.glob("*.safetensors")):
+    for f in sorted(path.glob('*.safetensors')):
         weights.update(mx.load(str(f)))
     # The HF embedding checkpoints omit the "model." key prefix mlx_lm's
     # causal-LM wrapper expects (it is a plain Qwen3 backbone, no lm_head).
-    net.load_weights([
-        (k if k.startswith(("model.", "lm_head")) else f"model.{k}", v)
-        for k, v in weights.items()
-    ])
+    net.load_weights(
+        [
+            (k if k.startswith(('model.', 'lm_head')) else f'model.{k}', v)
+            for k, v in weights.items()
+        ]
+    )
     mx.eval(net.parameters())
     return net, AutoTokenizer.from_pretrained(str(path))
 
 
 def embedded_text(
-    title: str | None, heading: str | None, kind: str, text: str,
+    title: str | None,
+    heading: str | None,
+    kind: str,
+    text: str,
     tokenizer: PreTrainedTokenizerBase,
 ) -> str:
     """The exact string that gets embedded for a chunk. `heading` is the
     chunk's heading_path, falling back to its section_heading."""
-    body = table_embed_text(text, tokenizer) if kind == "table" else text
-    prefix = "\n".join(p for p in (title if config.EMBED_TITLE_PREFIX else None, heading) if p)
-    return f"{prefix}\n\n{body}" if prefix else body
+    body = table_embed_text(text, tokenizer) if kind == 'table' else text
+    prefix = '\n'.join(
+        p for p in (title if config.EMBED_TITLE_PREFIX else None, heading) if p
+    )
+    return f'{prefix}\n\n{body}' if prefix else body
 
 
-def format_query(query: str, model: str = config.EMBED_MODEL) -> str:
-    """Counterpart of embedded_text() for retrieval: queries carry the task
-    instruction, documents don't. Qwen3 wants "Query:{q}", harrier "Query: {q}"."""
-    return f"Instruct: {config.QUERY_INSTRUCTION}\nQuery:{config.EMBED_MODELS[model][1]}{query}"
+def format_query(query: str) -> str:
+    """Counterpart of embedded_text() for retrieval: queries are wrapped in
+    config.QUERY_INSTRUCTION, documents are embedded as they are."""
+    return config.QUERY_INSTRUCTION.format(query=query)
 
 
 def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
@@ -136,7 +166,10 @@ def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
     padded tokens (items x longest), so one long chunk can't blow up memory."""
     cur: list[int] = []
     for i in order:
-        if cur and (len(cur) >= config.EMBED_MAX_BATCH or (len(cur) + 1) * len(ids[i]) > config.EMBED_BATCH_TOKENS):
+        if cur and (
+            len(cur) >= config.EMBED_MAX_BATCH
+            or (len(cur) + 1) * len(ids[i]) > config.EMBED_BATCH_TOKENS
+        ):
             yield cur
             cur = []
         cur.append(i)
@@ -144,7 +177,9 @@ def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
         yield cur
 
 
-def embed_texts(model: Model, tokenizer: PreTrainedTokenizerBase, texts: list[str]) -> Embedded:
+def embed_texts(
+    model: Model, tokenizer: PreTrainedTokenizerBase, texts: list[str]
+) -> Embedded:
     eot = tokenizer.convert_tokens_to_ids(_EOT)
     cap = config.MAX_EMBED_TOKENS - 1
     raw = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
@@ -156,7 +191,9 @@ def embed_texts(model: Model, tokenizer: PreTrainedTokenizerBase, texts: list[st
     for batch in _batches(order, ids):
         longest = max(len(ids[i]) for i in batch)
         arr = mx.array([ids[i] + [eot] * (longest - len(ids[i])) for i in batch])
-        hidden = model.model(arr)  # causal, so right-padding can't affect earlier positions
+        hidden = model.model(
+            arr
+        )  # causal, so right-padding can't affect earlier positions
         last = mx.array([len(ids[i]) - 1 for i in batch])
         v = hidden[mx.arange(len(batch)), last].astype(mx.float32)
         v = v / mx.linalg.norm(v, axis=-1, keepdims=True)
@@ -168,36 +205,50 @@ def embed_texts(model: Model, tokenizer: PreTrainedTokenizerBase, texts: list[st
 
 
 def _hash(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+    return hashlib.sha1(text.encode('utf-8')).hexdigest()
 
 
 def _insert_vectors(
-    con: duckdb.DuckDBPyConnection, model_id: str,
-    items: list[tuple[str, int, str, str]], vectors: np.ndarray,
+    con: duckdb.DuckDBPyConnection,
+    model_id: str,
+    items: list[tuple[str, int, str, str]],
+    vectors: np.ndarray,
 ) -> None:
     """Upsert (bibcode, chunk_index, hash) items with their vectors. Vectors go
     in as FLOAT[] SQL literals (%.9g round-trips float32 exactly) rather than
     bound parameters: converting 1024 Python floats per row through
     executemany cost ~40 ms/row, ~10x slower than the literal."""
     if not np.isfinite(vectors).all():
-        raise ValueError("non-finite values in embeddings")
+        raise ValueError('non-finite values in embeddings')
     for s in range(0, len(items), _INSERT_ROWS_PER_STATEMENT):
         part = range(s, min(s + _INSERT_ROWS_PER_STATEMENT, len(items)))
-        sql = "INSERT OR REPLACE INTO chunk_embeddings VALUES " + ",".join(
-            "(?, ?, ?, ?, [" + ",".join(f"{x:.9g}" for x in vectors[k]) + "]::FLOAT[])" for k in part
+        sql = 'INSERT OR REPLACE INTO chunk_embeddings VALUES ' + ','.join(
+            '(?, ?, ?, ?, [' + ','.join(f'{x:.9g}' for x in vectors[k]) + ']::FLOAT[])'
+            for k in part
         )
-        con.execute(sql, [p for k in part for p in (items[k][0], items[k][1], model_id, items[k][3])])
+        con.execute(
+            sql,
+            [
+                p
+                for k in part
+                for p in (items[k][0], items[k][1], model_id, items[k][3])
+            ],
+        )
 
 
 def _pending(
-    con: duckdb.DuckDBPyConnection, model_id: str, tokenizer: PreTrainedTokenizerBase,
+    con: duckdb.DuckDBPyConnection,
+    model_id: str,
+    tokenizer: PreTrainedTokenizerBase,
     include_boilerplate: bool,
 ) -> Iterator[tuple[str, int, str, str]]:
     """Yield (bibcode, chunk_index, embedded_text, hash) for every chunk whose
     stored hash for this model is missing or stale, in paper order."""
     done = {
-        (b, i): h for b, i, h in con.execute(
-            "SELECT bibcode, chunk_index, text_hash FROM chunk_embeddings WHERE model = ?", [model_id]
+        (b, i): h
+        for b, i, h in con.execute(
+            'SELECT bibcode, chunk_index, text_hash FROM chunk_embeddings WHERE model = ?',
+            [model_id],
         ).fetchall()
     }
     cur = con.cursor()  # separate connection, so window inserts don't disturb the scan
@@ -210,20 +261,24 @@ def _pending(
     )
     while rows := cur.fetchmany(2000):
         for bibcode, idx, kind, section_heading, heading_path, text, title in rows:
-            et = embedded_text(title, heading_path or section_heading, kind, text, tokenizer)
+            et = embedded_text(
+                title, heading_path or section_heading, kind, text, tokenizer
+            )
             h = _hash(et)
             if done.get((bibcode, idx)) != h:
                 yield bibcode, idx, et, h
 
 
-def embed(limit: int | None = None, model: str = config.EMBED_MODEL, include_boilerplate: bool = False) -> None:
+def embed(limit: int | None = None, include_boilerplate: bool = False) -> None:
     con = duckdb.connect(str(config.DB_PATH))
     try:
         columns = {r[1] for r in con.execute("PRAGMA table_info('chunks')").fetchall()}
-        if not {"kind", "heading_path"} <= columns:
-            raise SystemExit("chunks table is missing or has the old schema; run `pixi run chunk --rebuild` first")
+        if not {'kind', 'heading_path'} <= columns:
+            raise SystemExit(
+                'chunks table is missing or has the old schema; run `pixi run chunk --rebuild` first'
+            )
         con.execute(_SCHEMA)
-        model_id = model
+        model_id = config.EMBED_MODEL
 
         orphans = con.execute(
             """DELETE FROM chunk_embeddings e WHERE NOT EXISTS
@@ -231,7 +286,7 @@ def embed(limit: int | None = None, model: str = config.EMBED_MODEL, include_boi
                RETURNING 1"""
         ).fetchall()
         if orphans:
-            print(f"Deleted {len(orphans)} embeddings whose chunk no longer exists")
+            print(f'Deleted {len(orphans)} embeddings whose chunk no longer exists')
 
         if not include_boilerplate:
             # A chunk re-classified as boilerplate keeps its (bibcode, chunk_index), so
@@ -245,20 +300,27 @@ def embed(limit: int | None = None, model: str = config.EMBED_MODEL, include_boi
                 [model_id],
             ).fetchall()
             if demoted:
-                print(f"Deleted {len(demoted)} embeddings of chunks now tagged boilerplate")
+                print(
+                    f'Deleted {len(demoted)} embeddings of chunks now tagged boilerplate'
+                )
 
         eligible = con.execute(
-            "SELECT count(*) FROM chunks WHERE ? OR kind <> 'boilerplate'", [include_boilerplate]
+            "SELECT count(*) FROM chunks WHERE ? OR kind <> 'boilerplate'",
+            [include_boilerplate],
         ).fetchone()[0]
-        have = con.execute("SELECT count(*) FROM chunk_embeddings WHERE model = ?", [model_id]).fetchone()[0]
+        have = con.execute(
+            'SELECT count(*) FROM chunk_embeddings WHERE model = ?', [model_id]
+        ).fetchone()[0]
         est_pending = max(eligible - have, 0)
         target = min(est_pending, limit) if limit else est_pending
-        print(f"{model_id}: {have}/{eligible} chunks already embedded; ~{est_pending} pending"
-              + (f", stopping after {limit}" if limit else ""))
+        print(
+            f'{model_id}: {have}/{eligible} chunks already embedded; ~{est_pending} pending'
+            + (f', stopping after {limit}' if limit else '')
+        )
         if not target:
             return
 
-        net, tokenizer = load_embedder(model_id)
+        net, tokenizer = load_embedder()
 
         n_done = n_tokens = n_truncated = 0
         t0 = time.perf_counter()
@@ -272,7 +334,12 @@ def embed(limit: int | None = None, model: str = config.EMBED_MODEL, include_boi
             emb = embed_texts(net, tokenizer, [w[2] for w in window])
             con.begin()
             try:
-                _insert_vectors(con, model_id, [(b, i, et, h) for b, i, et, h in window], emb.vectors)
+                _insert_vectors(
+                    con,
+                    model_id,
+                    [(b, i, et, h) for b, i, et, h in window],
+                    emb.vectors,
+                )
                 con.commit()
             except BaseException:
                 con.rollback()
@@ -284,31 +351,45 @@ def embed(limit: int | None = None, model: str = config.EMBED_MODEL, include_boi
             mx.clear_cache()
             dt = time.perf_counter() - t0
             eta_h = (target - n_done) / (n_done / dt) / 3600
-            print(f"  {n_done}/{target} chunks | {n_tokens / dt:.0f} tok/s | ETA {eta_h:.1f} h", flush=True)
+            print(
+                f'  {n_done}/{target} chunks | {n_tokens / dt:.0f} tok/s | ETA {eta_h:.1f} h',
+                flush=True,
+            )
 
         for item in _pending(con, model_id, tokenizer, include_boilerplate):
             if limit and n_done + len(window) >= limit:
                 break
             window.append(item)
-            window_est += len(item[2]) // 3  # ~3.5 chars/token; only used to size the commit window
+            window_est += (
+                len(item[2]) // 3
+            )  # ~3.5 chars/token; only used to size the commit window
             if window_est >= config.EMBED_COMMIT_TOKENS:
                 flush()
         flush()
 
         dt = time.perf_counter() - t0
-        print(f"Embedded {n_done} chunks ({n_tokens} tokens, {n_truncated} truncated at "
-              f"{config.MAX_EMBED_TOKENS}) in {dt / 60:.1f} min")
+        print(
+            f'Embedded {n_done} chunks ({n_tokens} tokens, {n_truncated} truncated at '
+            f'{config.MAX_EMBED_TOKENS}) in {dt / 60:.1f} min'
+        )
     finally:
         con.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description="Embed chunks (MLX) into chunk_embeddings")
-    parser.add_argument("--limit", type=int, default=None, help="Stop after embedding N pending chunks")
-    parser.add_argument("--model", default=config.EMBED_MODEL, choices=list(config.EMBED_MODELS), help="embedding model")
-    parser.add_argument("--include-boilerplate", action="store_true", help="Also embed kind='boilerplate' chunks")
+    parser = argparse.ArgumentParser(
+        description='Embed chunks (MLX) into chunk_embeddings'
+    )
+    parser.add_argument(
+        '--limit', type=int, default=None, help='Stop after embedding N pending chunks'
+    )
+    parser.add_argument(
+        '--include-boilerplate',
+        action='store_true',
+        help="Also embed kind='boilerplate' chunks",
+    )
     args = parser.parse_args()
 
-    embed(limit=args.limit, model=args.model, include_boilerplate=args.include_boilerplate)
+    embed(limit=args.limit, include_boilerplate=args.include_boilerplate)

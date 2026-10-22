@@ -91,6 +91,6 @@ Cite as `First author et al. (year), bibcode`, with `https://ui.adsabs.harvard.e
 
 - `cannot open ... Conflicting lock` / "database locked": a pipeline job (usually `pixi run embed`, which can take hours) holds the database. Tell the user and retry later. Do not try to work around it.
 - `embed environment missing`: tell the user to run `pixi install -e embed` in the arXivRAG repo. Do not run it yourself.
-- `no embeddings for harrier-oss-v1-0.6b`, or a low-coverage warning: run `status`, report the numbers, and stop.
+- `no embeddings for microsoft/harrier-oss-v1-0.6b`, or a low-coverage warning: run `status`, report the numbers, and stop.
 - `--term regex rejected`: RE2 syntax error (usually a lookaround or backreference); rewrite with `|`, `\W*`, `\b`.
 - **Never run `embed`, `chunk`, `fetch`, `convert`, `query` or anything else that writes to the database or calls external APIs.** This tool is read-only.

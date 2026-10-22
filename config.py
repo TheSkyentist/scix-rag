@@ -19,6 +19,7 @@ CONVERT_IGNORE_PATH = DATA_DIR / 'convert_ignore.txt'
 # stem per line with a `# reason`). Skipped on later runs unless --retry-failed.
 FETCH_IGNORE_PATH = DATA_DIR / 'fetch_ignore.txt'
 
+# Created on import so every stage can write to them
 DATA_DIR.mkdir(exist_ok=True)
 HTML_DIR.mkdir(exist_ok=True)
 MARKDOWN_DIR.mkdir(exist_ok=True)
@@ -34,40 +35,39 @@ ADS_FIELDS = (
     'arxiv_class,citation_count,reference,citation,property,esources'
 )
 
-MAX_CHUNK_TOKENS = 1024
-MAX_TABLE_EMBED_TOKENS = 256  # tables are stored whole but only caption + header row get embedded
-
 # Embedding stage (src/embed.py)
-# Embedding models: id (stored as chunk_embeddings.model) -> (HF repo, text between "Query:" and the
-# query). Any Qwen3-backbone, last-token-pooled embedder loads the same way (src/embed.py), e.g.
-# 'Qwen3-Embedding-0.6B': ('Qwen/Qwen3-Embedding-0.6B', ''); bf16 only (8-/4-bit were slower, not
-# faster). EMBED_MODEL is what `embed` writes, `search` reads and `chunk` takes its tokenizer from.
-EMBED_MODELS = {
-    'harrier-oss-v1-0.6b': ('microsoft/harrier-oss-v1-0.6b', ' '),
-}
-EMBED_MODEL = 'harrier-oss-v1-0.6b'  # chosen by a retrieval eval in Oct 2026; see CLAUDE.md
-MAX_EMBED_TOKENS = 8192  # chunks longer than this are truncated (model context is 32K)
-EMBED_BATCH_TOKENS = 16384  # max padded tokens (items x longest) per forward pass
-EMBED_MAX_BATCH = 16
-EMBED_COMMIT_TOKENS = 250_000  # ~tokens embedded between DB commits; bounds what Ctrl-C can lose
-EMBED_TITLE_PREFIX = True  # prepend the paper title to each chunk's embedded text (open question)
-# Queries (not documents) are formatted "Instruct: {task}\nQuery:{sep}{query}" (sep per EMBED_MODELS).
+# EMBED_MODEL must be a Qwen3-backbone embedding model (a Hugging Face repo id).
+# QUERY_INSTRUCTION must format queries the way your model expects; check its model card.
+EMBED_MODEL = 'microsoft/harrier-oss-v1-0.6b'
 QUERY_INSTRUCTION = (
-    'Given a question or topic from astrophysics research, retrieve passages '
-    'from scientific papers that answer or discuss it'
+    'Instruct: Given a question or topic from astronomy or astrophysics research, '
+    'retrieve passages from scientific papers that answer or discuss it\nQuery: {query}'
 )
-ADS_PAGE_SIZE = 200
+
+# Chunking stage (src/chunk.py)
+MAX_CHUNK_TOKENS = 1024  # target tokens per chunk; one over-long sentence can exceed it
+# Tables are stored whole, but only the caption and header row (up to this) are embedded
+MAX_TABLE_EMBED_TOKENS = 256
+
+# Embedding stage: tuning (src/embed.py)
+MAX_EMBED_TOKENS = 8192  # longer chunks are truncated
+EMBED_BATCH_TOKENS = 16384  # max padded tokens per forward pass
+EMBED_MAX_BATCH = 16  # max chunks per forward pass
+EMBED_COMMIT_TOKENS = (
+    250_000  # tokens embedded per DB commit; Ctrl-C loses at most this
+)
+# Prepend the paper title to each chunk's embedded text; changing it re-embeds the chunks
+EMBED_TITLE_PREFIX = True
+
+# ADS and arXiv requests (src/ads_query.py, src/fetch.py)
+ADS_PAGE_SIZE = 200  # seed records per ADS search request
 ADS_BATCH_SIZE = 75  # bibcodes per OR'd batch-fetch query
 ADS_DELAY = 0.5  # seconds between ADS requests
 ARXIV_DELAY = 1.0  # seconds between arXiv HTML fetches
 
-# Below this, treat a conversion (HTML or PDF path) as empty/failed.
-# Calibrated against the corpus: smallest genuine converted paper so far
-# is ~1900 chars; ar5iv's own "conversion had a fatal error" placeholder
-# still contains an (empty) <article class="ltx_document"> plus a stray
-# error <div>, so a naive "ltx_document in html" check isn't enough --
-# validate by actually running the real converter and checking it
-# produced substance.
+# Below this many characters a conversion counts as empty/failed (the smallest genuine
+# paper so far is ~1,900). Validated by running the real converter, since ar5iv's error
+# placeholder still contains an empty <article class="ltx_document">.
 MIN_MARKDOWN_CHARS = 500
 
 DB_PATH = DATA_DIR / 'papers.duckdb'
