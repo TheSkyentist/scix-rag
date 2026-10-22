@@ -1,23 +1,24 @@
 """
-Build a paper + citation-edge test corpus from a single seed paper.
+Build a paper + citation-edge corpus from ADS: one or many seed papers plus
+their direct references and citations.
 
-Fetches the seed paper's own metadata (bibcode is the row key -- not every
+The seeds come from an ADS search (--query) or a single bibcode (--bibcode,
+which is just the query `bibcode:"..."`). Bibcode is the row key -- not every
 paper in a citation graph has an arXiv ID, so bibcode has to be the anchor;
-arxiv_id is stored alongside as the key we'll actually use for Arcana
-uploads once a paper has one). ADS returns each record's `reference` and
-`citation` fields as bibcode lists directly, so no extra references()/
-citations() search calls are needed: one query for the seed, one or two
-batched bibcode:(... OR ...) queries for its direct neighbors.
+arxiv_id is stored alongside as the key `fetch` uses for on-disk filenames
+once a paper has one. ADS returns each record's `reference` and `citation`
+fields as bibcode lists directly, so no extra references()/citations() search
+calls are needed: the seed search carries the neighbor lists, and one batched
+bibcode:(... OR ...) query per 75 neighbors fetches their metadata.
 
 Edges are stored as directed (citing_bibcode, cited_bibcode) pairs, star
-topology only: the seed's direct references and direct citations. Cross-
+topology only: each seed's direct references and direct citations. Cross-
 links among the neighbors themselves are not fetched (would require a
 reference/citation pull per neighbor -- a depth-2 expansion, not done here).
 
 Run directly:
     pixi run query --bibcode "2025A&A...702A..57H"
     pixi run query --query 'abs:"Little Red Dot"'   # many seeds at once
-    pixi run query-lrd                              # shortcut for the LRD search above (first step of `pixi run all`)
 """
 
 from __future__ import annotations
@@ -127,13 +128,48 @@ def _session() -> httpx.Client:
     )
 
 
-def _search(client: httpx.Client, q: str, rows: int) -> list[dict]:
-    resp = client.get(
-        f'{config.ADS_BASE_URL}/search/query',
-        params={'q': q, 'fl': config.ADS_FIELDS, 'rows': rows},
-    )
+def _get_response(client: httpx.Client, params: dict) -> dict:
+    resp = client.get(f'{config.ADS_BASE_URL}/search/query', params=params)
+    if resp.status_code == 429:
+        raise SystemExit(
+            'ADS rate limit reached (ADS allows about 5000 requests per day per API key); '
+            're-run later'
+        )
     resp.raise_for_status()
-    return resp.json()['response']['docs']
+    return resp.json()['response']
+
+
+def _search(client: httpx.Client, q: str, rows: int) -> list[dict]:
+    return _get_response(client, {'q': q, 'fl': config.ADS_FIELDS, 'rows': rows})[
+        'docs'
+    ]
+
+
+def _search_seeds(client: httpx.Client, q: str, max_seeds: int) -> list[dict]:
+    """Page through a search, up to max_seeds records; warn if the search has more."""
+    docs: list[dict] = []
+    found = 0
+    while len(docs) < max_seeds:
+        response = _get_response(
+            client,
+            {
+                'q': q,
+                'fl': config.ADS_FIELDS,
+                'rows': min(config.ADS_PAGE_SIZE, max_seeds - len(docs)),
+                'start': len(docs),
+            },
+        )
+        found = response['numFound']
+        docs.extend(response['docs'])
+        if not response['docs'] or len(docs) >= found:
+            break
+        time.sleep(config.ADS_DELAY)
+    if found > len(docs):
+        print(
+            f'  [warning] the search matches {found} papers but only the first {len(docs)} '
+            f'were used as seeds; raise --max-seeds or narrow the query'
+        )
+    return docs
 
 
 def _fetch_by_bibcode(client: httpx.Client, bibcode: str) -> dict | None:
@@ -188,114 +224,145 @@ def _doc_to_params(d: dict, query_source: str) -> tuple:
     )
 
 
-def build_test_corpus(seed_bibcode: str) -> None:
-    con = duckdb.connect(str(config.DB_PATH))
-    con.execute(_SCHEMA)
-
-    with _session() as client:
-        print(f'Fetching seed paper: {seed_bibcode}')
-        seed = _fetch_by_bibcode(client, seed_bibcode)
-        if seed is None:
-            print(f'  [error] no ADS record found for bibcode {seed_bibcode!r}')
-            return
-
-        references = seed.get('reference') or []
-        citations = seed.get('citation') or []
-        print(f'  → {len(references)} references, {len(citations)} citations')
-
-        print(f'Fetching metadata for {len(references)} referenced papers...')
-        ref_docs = _fetch_many_by_bibcode(client, references)
-        print(f'  → got {len(ref_docs)} records')
-
-        print(f'Fetching metadata for {len(citations)} citing papers...')
-        cite_docs = _fetch_many_by_bibcode(client, citations)
-        print(f'  → got {len(cite_docs)} records')
-
-    rows = [_doc_to_params(seed, 'seed')]
-    rows += [_doc_to_params(d, f'reference_of:{seed_bibcode}') for d in ref_docs]
-    rows += [_doc_to_params(d, f'citation_of:{seed_bibcode}') for d in cite_docs]
-
-    con.executemany(_UPSERT_PAPERS, rows)
-
-    edges = [(seed_bibcode, r) for r in references]  # seed cites r
-    edges += [(c, seed_bibcode) for c in citations]  # c cites seed
-    con.executemany(_INSERT_EDGE, edges)
-    con.commit()
-
-    n_papers = con.execute('SELECT count(*) FROM papers').fetchone()[0]
-    n_edges = con.execute('SELECT count(*) FROM citation_edges').fetchone()[0]
-    print(
-        f'\nDone. papers={n_papers} (total in DB), citation_edges={n_edges} → {config.DB_PATH}'
-    )
-    con.close()
+def _read_bibcode_file(path: str) -> list[str]:
+    """One bibcode per line; blank lines and `#` comments (whole-line or trailing) are ignored."""
+    lines = (line.split('#', 1)[0].strip() for line in open(path, encoding='utf-8'))
+    return [line for line in lines if line]
 
 
-def build_corpus_from_search(
-    query: str,
+def _known_bibcodes(dry_run: bool) -> set[str]:
+    """Bibcodes already in papers.duckdb; a dry run never creates or writes the file."""
+    if dry_run and not config.DB_PATH.exists():
+        return set()
+    con = duckdb.connect(str(config.DB_PATH), read_only=dry_run)
+    try:
+        return {r[0] for r in con.execute('SELECT bibcode FROM papers').fetchall()}
+    except duckdb.CatalogException:  # fresh database, no papers table yet
+        return set()
+    finally:
+        con.close()
+
+
+def _batches(n: int, size: int) -> int:
+    return -(-n // size)
+
+
+def build_corpus(
+    query: str | None = None,
+    bibcodes: list[str] | None = None,
     max_seeds: int = 2000,
-    pull_references: bool = True,
-    pull_citations: bool = True,
+    pull_references: bool = False,
+    pull_citations: bool = False,
+    dry_run: bool = False,
+    canonicalize_after: bool = True,
 ) -> None:
     """
-    Same star-topology trick as build_test_corpus, but with many seed papers
-    at once (an ADS query) instead of one bibcode. Each seed's own
-    reference/citation bibcode lists come back in the same search response
-    (no per-seed follow-up call needed).
+    Add the seeds -- every paper matching an ADS query plus any listed bibcodes
+    (the union) -- to papers.duckdb, and with pull_references/pull_citations the
+    papers each seed cites / is cited by. Each seed's own reference/citation
+    bibcode lists come back in the same record (no per-seed follow-up call);
+    only the neighbors' metadata costs extra requests. At most max_seeds seeds
+    are taken from the query.
 
     Only neighbor bibcodes not already present in papers.duckdb get
-    batch-fetched -- this makes it safe (and cheap) to re-run the exact same
-    query repeatedly, e.g. weekly with no date restriction at all: already-
-    known seeds just get their metadata refreshed (picking up newly-
-    accumulated citations), already-known neighbors are skipped entirely,
-    and only genuinely new bibcodes cost an ADS call.
+    batch-fetched -- this makes it safe (and cheap) to re-run: already-known
+    seeds just get their metadata refreshed (picking up newly-accumulated
+    citations), already-known neighbors are skipped entirely, and only
+    genuinely new bibcodes cost an ADS call.
 
-    pull_references/pull_citations let a weekly "citations only" run skip
-    references entirely, since references mostly reconverge on literature
-    already ingested rather than surfacing anything new.
+    dry_run does the searches but writes nothing, and prints what a real run
+    would add.
     """
-    con = duckdb.connect(str(config.DB_PATH))
-    con.execute(_SCHEMA)
+    bibcodes = list(dict.fromkeys(bibcodes or []))
+    known_bibcodes = _known_bibcodes(dry_run)
 
-    known_bibcodes = {
-        r[0] for r in con.execute('SELECT bibcode FROM papers').fetchall()
-    }
-
+    seeds: dict[str, tuple[dict, str]] = {}  # bibcode -> (ADS record, query_source)
     with _session() as client:
-        print(f'Searching: {query!r}')
-        seeds = _search(client, query, rows=max_seeds)
-        print(f'  → {len(seeds)} seed papers')
+        if query:
+            print(f'Searching: {query!r}')
+            for d in _search_seeds(client, query, max_seeds):
+                if d.get('bibcode'):
+                    seeds.setdefault(d['bibcode'], (d, f'search:{query}'))
+            print(f'  → {len(seeds)} seed papers from the search')
+        if bibcodes:
+            print(f'Fetching {len(bibcodes)} listed bibcodes...')
+            found = _fetch_many_by_bibcode(client, bibcodes)
+            answered = {
+                b
+                for d in found
+                for b in [d.get('bibcode'), *(d.get('alternate_bibcode') or [])]
+            }
+            missing = [b for b in bibcodes if b not in answered]
+            for d in found:
+                if d.get('bibcode'):
+                    seeds.setdefault(d['bibcode'], (d, 'seed'))
+            print(f'  → got {len(found)} records')
+            if missing:
+                shown = ', '.join(missing[:20]) + (' ...' if len(missing) > 20 else '')
+                print(
+                    f'  [warning] ADS has no record for {len(missing)} bibcodes, skipped: {shown}'
+                )
+        if not seeds:
+            raise SystemExit('No ADS records found for the seeds; nothing to add')
 
-        seed_bibcodes = {d['bibcode'] for d in seeds if d.get('bibcode')}
-
-        neighbor_bibcodes: set[str] = set()
+        # bibcode -> query_source of the first seed that introduced it
+        neighbors: dict[str, str] = {}
         edges: list[tuple[str, str]] = []
-        for d in seeds:
-            bib = d.get('bibcode')
-            if not bib:
-                continue
+        for bib, (d, _) in seeds.items():
             refs = (d.get('reference') or []) if pull_references else []
             cites = (d.get('citation') or []) if pull_citations else []
-            neighbor_bibcodes.update(refs)
-            neighbor_bibcodes.update(cites)
+            for r in refs:
+                neighbors.setdefault(r, f'reference_of:{bib}')
+            for c in cites:
+                neighbors.setdefault(c, f'citation_of:{bib}')
             edges += [(bib, r) for r in refs]  # seed cites r
             edges += [(c, bib) for c in cites]  # c cites seed
 
-        already_have = known_bibcodes | seed_bibcodes
-        to_fetch = sorted(neighbor_bibcodes - already_have)
-        print(
-            f'  → {len(neighbor_bibcodes)} distinct referenced/citing bibcodes '
-            f'({len(to_fetch)} new, {len(neighbor_bibcodes) - len(to_fetch)} already in the database)'
+        to_fetch = sorted(set(neighbors) - known_bibcodes - set(seeds))
+        n_seed_requests = _batches(len(bibcodes), config.ADS_BATCH_SIZE) + (
+            _batches(len(seeds), config.ADS_PAGE_SIZE) if query else 0
         )
+        if pull_references or pull_citations:
+            print(
+                f'  → {len(neighbors)} distinct referenced/citing bibcodes '
+                f'({len(to_fetch)} new, {len(neighbors) - len(to_fetch)} already in the database or seeds)'
+            )
 
-        print(f'Fetching metadata for {len(to_fetch)} neighbor papers...')
-        neighbor_docs = _fetch_many_by_bibcode(client, to_fetch)
-        print(f'  → got {len(neighbor_docs)} records')
+        if dry_run:
+            total = len(known_bibcodes | set(seeds) | set(to_fetch))
+            n_requests = (
+                n_seed_requests
+                + _batches(len(to_fetch), config.ADS_BATCH_SIZE)
+                + (_batches(total, config.ADS_BATCH_SIZE) if canonicalize_after else 0)
+            )
+            print('\nDry run, nothing written. A real run would add:')
+            print(f'  {len(seeds):,} seeds ({len(set(seeds) - known_bibcodes):,} new)')
+            if pull_references or pull_citations:
+                print(
+                    f'  {len(neighbors):,} neighbors ({len(to_fetch):,} new, '
+                    f'{len(neighbors) - len(to_fetch):,} already known)'
+                )
+            print(f'  about {n_requests:,} ADS requests')
+            return
 
-    rows = [_doc_to_params(d, f'search:{query}') for d in seeds]
-    rows += [_doc_to_params(d, f'expansion_of_search:{query}') for d in neighbor_docs]
+        neighbor_docs: list[dict] = []
+        if to_fetch:
+            print(f'Fetching metadata for {len(to_fetch)} neighbor papers...')
+            neighbor_docs = _fetch_many_by_bibcode(client, to_fetch)
+            print(f'  → got {len(neighbor_docs)} records')
 
+    rows = [_doc_to_params(d, source) for d, source in seeds.values()]
+    # ADS may hand back a record under a different (canonical) bibcode than the one listed
+    rows += [
+        _doc_to_params(d, neighbors.get(d.get('bibcode'), 'expansion'))
+        for d in neighbor_docs
+    ]
+
+    con = duckdb.connect(str(config.DB_PATH))
+    con.execute(_SCHEMA)
     con.executemany(_UPSERT_PAPERS, rows)
-    con.executemany(_INSERT_EDGE, edges)
+    if edges:  # executemany rejects an empty parameter list
+        con.executemany(_INSERT_EDGE, edges)
     con.commit()
 
     n_papers = con.execute('SELECT count(*) FROM papers').fetchone()[0]
@@ -310,23 +377,41 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Build a citation-graph corpus from ADS'
+        description='Build a citation-graph corpus from ADS: seeds (a search and/or bibcodes), '
+        'optionally plus their references and citations'
     )
     parser.add_argument(
-        '--bibcode', help='Single seed bibcode, e.g. "2025A&A...702A..57H"'
+        '--query',
+        help='ADS search whose matches are seeds, e.g. \'abs:"Little Red Dots"\'',
     )
     parser.add_argument(
-        '--query', help='ADS query for many seeds, e.g. \'abs:"Little Red Dot"\''
+        '--bibcode',
+        action='append',
+        default=[],
+        help='Seed bibcode, e.g. "2025A&A...702A..57H" (repeatable)',
     )
     parser.add_argument(
-        '--no-references',
+        '--bibcode-file',
+        help='Text file of seed bibcodes, one per line (# comments allowed)',
+    )
+    parser.add_argument(
+        '--max-seeds',
+        type=int,
+        default=2000,
+        help='Most seed papers to take from --query (default 2000); a warning is printed if the search has more',
+    )
+    parser.add_argument(
+        '--references', action='store_true', help='Also add the papers each seed cites'
+    )
+    parser.add_argument(
+        '--citations',
         action='store_true',
-        help='With --query, skip pulling references (citations only)',
+        help='Also add the papers that cite each seed',
     )
     parser.add_argument(
-        '--no-citations',
+        '--dry-run',
         action='store_true',
-        help='With --query, skip pulling citations (references only)',
+        help='Run the searches and print what would be added, without changing the database',
     )
     parser.add_argument(
         '--no-canonicalize',
@@ -335,18 +420,26 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    if args.bibcode:
-        build_test_corpus(seed_bibcode=args.bibcode)
-    elif args.query:
-        build_corpus_from_search(
-            query=args.query,
-            pull_references=not args.no_references,
-            pull_citations=not args.no_citations,
-        )
-    else:
-        parser.error('pass --bibcode or --query')
+    bibcodes = list(args.bibcode)
+    if args.bibcode_file:
+        try:
+            bibcodes += _read_bibcode_file(args.bibcode_file)
+        except OSError as e:
+            parser.error(f'cannot read --bibcode-file: {e}')
+    if not (args.query or bibcodes):
+        parser.error('pass --query, --bibcode or --bibcode-file')
 
-    if not args.no_canonicalize:
+    build_corpus(
+        query=args.query,
+        bibcodes=bibcodes,
+        max_seeds=args.max_seeds,
+        pull_references=args.references,
+        pull_citations=args.citations,
+        dry_run=args.dry_run,
+        canonicalize_after=not args.no_canonicalize,
+    )
+
+    if not args.no_canonicalize and not args.dry_run:
         # ADS re-keys records over time (preprint -> journal bibcode, gained arXiv ids), which
         # leaves twin rows and stale ids behind; fold every paper back onto its canonical bibcode.
         from .canonicalize import canonicalize
