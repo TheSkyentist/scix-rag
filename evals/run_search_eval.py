@@ -25,8 +25,8 @@ def _papers(hits: list[S.Hit]) -> list[str]:
     return list(dict.fromkeys(h.bibcode for h in hits))
 
 
-def run_case(con, model_id: str, size: str, case: dict, k: int, per_paper: int, n_list: int, tw: float | None) -> dict:
-    qvecs = S._embed_queries(case["queries"], size)
+def run_case(con, model_id: str, case: dict, k: int, per_paper: int, n_list: int, tw: float | None) -> dict:
+    qvecs = S._embed_queries(case["queries"], model_id)
     n_cand = max(100, 10 * k)
     since = case.get("since")
     ranked = [S._top_chunks(con, model_id, qv, n_cand, since) for qv in qvecs]
@@ -52,18 +52,18 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--per-paper", type=int, default=2)
     ap.add_argument("--list", type=int, default=S.DEFAULT_LIST_PAPERS, help="size of the 'other papers' listing")
-    ap.add_argument("--model-size", default=config.EMBED_MODEL_SIZE)
+    ap.add_argument("--model", default=config.EMBED_MODEL, choices=list(config.EMBED_MODELS))
     ap.add_argument("--case", default=None, help="run only this case id")
     ap.add_argument("--term-weight", type=float, default=None, help="RRF weight of the term rankings (default: search.TERM_WEIGHT)")
     args = ap.parse_args()
 
     con = S._connect(args.db)
-    model_id = f"Qwen3-Embedding-{args.model_size}"
+    model_id = args.model
     cases = [c for c in json.loads(args.gold.read_text())["cases"] if not args.case or c["id"] == args.case]
     totals = {m: [0, 0] for m in ("semantic", "fused", "+listing", "term-only")}
     for case in cases:
         gold = set(case["gold"])
-        r = run_case(con, model_id, args.model_size, case, args.k, args.per_paper, args.list, args.term_weight)
+        r = run_case(con, model_id, case, args.k, args.per_paper, args.list, args.term_weight)
         found = {
             "semantic": gold & set(r["semantic"]),
             "fused": gold & set(r["fused"]),
