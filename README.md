@@ -228,6 +228,29 @@ pixi run chunk --rebuild                 # drop the chunks table and chunk every
 - **Changing the chunk size:** edit `MAX_CHUNK_TOKENS` in `config.py`, run `chunk --rebuild`, and then run `embed` straight away. Vectors are stored apart from the chunks, together with a hash of the text they came from. So `--rebuild` keeps the vector of every chunk whose text did not change and only the changed chunks are embedded again. Until `embed` has run, search can return a changed chunk with the vector of its old text.
 - **Re-converted papers:** a paper is chunked once. If you convert it again and get new Markdown, `chunk` does not notice, so use `--rebuild`.
 
+## Stage 5: embed
+
+`embed` turns every chunk into a vector, a list of 1,024 numbers that captures what the passage is about. Search compares your question with these vectors, so it finds passages by meaning and not only by matching words. The model runs on your own machine, on the GPU of your Mac through MLX. By default it is Microsoft's [harrier-oss-v1-0.6b](https://huggingface.co/microsoft/harrier-oss-v1-0.6b) (MIT license). The first run downloads its weights, about 1.2 GB.
+
+**This is slow.** The first embedding of a corpus of about 11,000 papers, 345,000 chunks and 200 million tokens took about 16 hours on the machine this was developed on, at roughly 3,500 tokens per second. Yours will differ. It only has to be done once: after that, adding papers only embeds the new chunks. It is safe to leave running overnight and to stop whenever you want.
+
+**What gets embedded.** For each chunk it embeds the paper title, the heading path and the chunk text, so a passage under a generic heading still carries its context. For a table chunk, only the caption and header row. Boilerplate chunks (acknowledgements and the like) are skipped.
+
+### What gets stored
+
+The `chunk_embeddings` table has one row per chunk and model: `bibcode`, `chunk_index`, `model`, `text_hash` and `embedding`. The hash covers the exact text that was embedded, and the model is stored as its Hugging Face name. For this corpus the table adds about 1.4 GB to the database.
+
+```
+pixi run embed --dry-run                 # how many chunks are pending and roughly how long they would take, without embedding
+pixi run embed --limit 200               # embed the first 200 pending chunks, as a smoke test
+pixi run embed                           # embed everything that is pending
+```
+
+- **Resumable:** vectors are saved in batches of about 250,000 tokens. Ctrl-C loses at most the batch in progress, and the next run carries on.
+- **Only changes are re-embedded:** a chunk is pending when it has no vector or when the hash of its text has changed. After `chunk --rebuild`, or after switching `EMBED_TITLE_PREFIX` in `config.py`, only the affected chunks are embedded again. Vectors for chunks that no longer exist are deleted at the start of a run.
+- **The database is locked while it runs:** `embed` keeps the database open for writing until it finishes, so `search` and `browse` cannot open it in the meantime. For the first big run, that means search is unavailable for many hours.
+- **Changing the model:** set `EMBED_MODEL` in `config.py` to another embedding model, and set `QUERY_INSTRUCTION` to the query format that model's model card asks for. The model must have a Qwen3 backbone and use last-token pooling, and `embed` stops with a clear message if it doesn't. Run `embed` again to embed every chunk with the new model. Search only uses the vectors of the configured model.
+
 ## Browsing the database
 
 `browse` opens a [marimo](https://marimo.io) notebook in your browser, with the corpus attached read-only so nothing you do there can change it:

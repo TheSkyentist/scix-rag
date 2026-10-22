@@ -1,13 +1,12 @@
 """
 Embed every chunk in `chunks` with config.EMBED_MODEL (a Qwen3-backbone embedder,
-currently harrier-oss-v1-0.6b; run locally with MLX, bf16 -- quantization saved
-memory but was slower, see CLAUDE.md) and store the vectors in `chunk_embeddings` in
-papers.duckdb.
+currently harrier-oss-v1-0.6b; run locally with MLX, bf16 -- 8-/4-bit saved memory
+but were slower) and store the vectors in `chunk_embeddings` in papers.duckdb.
 
 Embedded text for a chunk = paper title + heading path (+ blank line) + body,
 where body is the chunk text, or for `kind='table'` just the caption + header
-row (chunk.table_embed_text). `kind='boilerplate'` chunks are skipped unless
---include-boilerplate. Documents get no instruction prefix; queries (retrieval
+row (chunk.table_embed_text). `kind='boilerplate'` chunks are never embedded (they
+stay reachable through `search grep`). Documents get no instruction prefix; queries (retrieval
 stage) use config.QUERY_INSTRUCTION (embed.format_query). The vector is the final
 hidden state of the appended <|endoftext|> token, L2-normalized, so cosine
 similarity is a dot product.
@@ -17,9 +16,11 @@ the exact embedded text. That is the "done" test: a chunk is pending if it has
 no row for this model or its stored hash differs from the current embedded
 text's. So re-chunking (which reshuffles chunk_index), a changed prefix
 (config.EMBED_TITLE_PREFIX) or an edited table rule all re-embed exactly the
-affected chunks instead of leaving stale vectors attached to the wrong text.
-Rows whose (bibcode, chunk_index) no longer exists in `chunks` are deleted on
-start. Vectors are stored as FLOAT[] (any dimension, so several models can
+affected chunks instead of leaving stale vectors attached to the wrong text. What
+is pending is found by comparing those hashes, never by comparing counts: equal
+counts say nothing about whether the stored vectors still match the text.
+Rows whose (bibcode, chunk_index) no longer exists in `chunks`, and vectors of
+chunks now tagged boilerplate, are deleted on start. Vectors are stored as FLOAT[] (any dimension, so several models can
 coexist); cast with `embedding::FLOAT[1024]` for DuckDB's VSS/array functions.
 
 Chunks are pulled in paper order, collected into windows of about
@@ -29,13 +30,16 @@ loses at most the window in flight, and re-running resumes.
 
 Run directly (from the `embed` environment):
     pixi run embed
+    pixi run embed --dry-run              # find what is pending, embed nothing
     pixi run embed --limit 200            # smoke-test on the first 200 pending chunks
 """
 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import os
 import time
 from pathlib import Path
 from typing import Iterator, NamedTuple
@@ -45,6 +49,11 @@ import mlx.core as mx
 import numpy as np
 from huggingface_hub import snapshot_download
 from mlx_lm.models.qwen3 import Model, ModelArgs
+
+# Only the tokenizer is used from transformers; without this it warns on every run
+# that PyTorch is missing.
+os.environ.setdefault('TRANSFORMERS_NO_ADVISORY_WARNINGS', '1')
+
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 import config
@@ -237,27 +246,26 @@ def _insert_vectors(
 
 
 def _pending(
-    con: duckdb.DuckDBPyConnection,
-    model_id: str,
-    tokenizer: PreTrainedTokenizerBase,
-    include_boilerplate: bool,
+    con: duckdb.DuckDBPyConnection, model_id: str, tokenizer: PreTrainedTokenizerBase
 ) -> Iterator[tuple[str, int, str, str]]:
-    """Yield (bibcode, chunk_index, embedded_text, hash) for every chunk whose
-    stored hash for this model is missing or stale, in paper order."""
-    done = {
-        (b, i): h
-        for b, i, h in con.execute(
-            'SELECT bibcode, chunk_index, text_hash FROM chunk_embeddings WHERE model = ?',
-            [model_id],
-        ).fetchall()
-    }
+    """Yield (bibcode, chunk_index, embedded_text, hash) for every non-boilerplate
+    chunk whose stored hash for this model is missing or stale, in paper order."""
+    try:
+        done = {
+            (b, i): h
+            for b, i, h in con.execute(
+                'SELECT bibcode, chunk_index, text_hash FROM chunk_embeddings WHERE model = ?',
+                [model_id],
+            ).fetchall()
+        }
+    except duckdb.CatalogException:  # nothing embedded yet
+        done = {}
     cur = con.cursor()  # separate connection, so window inserts don't disturb the scan
     cur.execute(
         """SELECT c.bibcode, c.chunk_index, c.kind, c.section_heading, c.heading_path, c.text, p.title
            FROM chunks c JOIN papers p USING (bibcode)
-           WHERE ? OR c.kind <> 'boilerplate'
-           ORDER BY c.bibcode, c.chunk_index""",
-        [include_boilerplate],
+           WHERE c.kind <> 'boilerplate'
+           ORDER BY c.bibcode, c.chunk_index"""
     )
     while rows := cur.fetchmany(2000):
         for bibcode, idx, kind, section_heading, heading_path, text, title in rows:
@@ -269,7 +277,70 @@ def _pending(
                 yield bibcode, idx, et, h
 
 
-def embed(limit: int | None = None, include_boilerplate: bool = False) -> None:
+# Tokens per second `embed` reached on the machine it was developed on; only used
+# for the rough time estimate in --dry-run, real speed depends on your hardware.
+_REFERENCE_TOKENS_PER_SECOND = 3500
+
+
+def _dry_run(limit: int | None) -> None:
+    """Report what a run would do. Read-only: no model is loaded, nothing is written."""
+    if not config.DB_PATH.exists():
+        raise SystemExit(f'No database at {config.DB_PATH}; run `pixi run query` first')
+    con = duckdb.connect(str(config.DB_PATH), read_only=True)
+    try:
+        columns = {r[1] for r in con.execute("PRAGMA table_info('chunks')").fetchall()}
+        if not {'kind', 'heading_path'} <= columns:
+            raise SystemExit(
+                'chunks table is missing or has the old schema; run `pixi run chunk --rebuild` first'
+            )
+        model_id = config.EMBED_MODEL
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        n_pending = n_chars = 0
+        for _, _, text, _ in _pending(con, model_id, tokenizer):
+            n_pending += 1
+            n_chars += len(text)
+            if limit and n_pending >= limit:
+                break
+        try:
+            orphans = con.execute(
+                """SELECT count(*) FROM chunk_embeddings e WHERE NOT EXISTS
+                   (SELECT 1 FROM chunks c WHERE c.bibcode = e.bibcode AND c.chunk_index = e.chunk_index)"""
+            ).fetchone()[0]
+            demoted = con.execute(
+                """SELECT count(*) FROM chunk_embeddings e WHERE e.model = ? AND EXISTS
+                   (SELECT 1 FROM chunks c WHERE c.bibcode = e.bibcode
+                      AND c.chunk_index = e.chunk_index AND c.kind = 'boilerplate')""",
+                [model_id],
+            ).fetchone()[0]
+        except duckdb.CatalogException:  # nothing embedded yet
+            orphans = demoted = 0
+    finally:
+        con.close()
+
+    n_tokens = int(n_chars / 3.5)  # same rough chars-per-token rule the run uses
+    seconds = n_tokens / _REFERENCE_TOKENS_PER_SECOND
+    waited = f'{seconds / 3600:.1f} h' if seconds >= 3600 else f'{seconds / 60:.0f} min'
+    print(f'Dry run, nothing embedded. Model: {model_id}')
+    print(
+        f'  {n_pending:,} chunks pending'
+        + (' (stopped counting at --limit)' if limit and n_pending >= limit else '')
+    )
+    print(f'  about {n_tokens / 1e6:.1f} million tokens')
+    print(
+        f'  roughly {waited} at {_REFERENCE_TOKENS_PER_SECOND:,} tokens/s, the speed on the development machine'
+    )
+    if orphans or demoted:
+        print(
+            f'  a real run would first delete {orphans:,} vectors whose chunk is gone '
+            f'and {demoted:,} vectors of chunks now tagged boilerplate'
+        )
+
+
+def embed(limit: int | None = None, dry_run: bool = False) -> None:
+    if dry_run:
+        _dry_run(limit)
+        return
+
     con = duckdb.connect(str(config.DB_PATH))
     try:
         columns = {r[1] for r in con.execute("PRAGMA table_info('chunks')").fetchall()}
@@ -288,39 +359,45 @@ def embed(limit: int | None = None, include_boilerplate: bool = False) -> None:
         if orphans:
             print(f'Deleted {len(orphans)} embeddings whose chunk no longer exists')
 
-        if not include_boilerplate:
-            # A chunk re-classified as boilerplate keeps its (bibcode, chunk_index), so
-            # it isn't an orphan -- but it's no longer eligible, and search scores every
-            # row of chunk_embeddings. Drop its vector for this model.
-            demoted = con.execute(
-                """DELETE FROM chunk_embeddings e WHERE e.model = ? AND EXISTS
-                   (SELECT 1 FROM chunks c WHERE c.bibcode = e.bibcode
-                      AND c.chunk_index = e.chunk_index AND c.kind = 'boilerplate')
-                   RETURNING 1""",
-                [model_id],
-            ).fetchall()
-            if demoted:
-                print(
-                    f'Deleted {len(demoted)} embeddings of chunks now tagged boilerplate'
-                )
+        # A chunk re-classified as boilerplate keeps its (bibcode, chunk_index), so it
+        # isn't an orphan -- but it's no longer eligible, and search scores every row of
+        # chunk_embeddings. Drop its vector for this model.
+        demoted = con.execute(
+            """DELETE FROM chunk_embeddings e WHERE e.model = ? AND EXISTS
+               (SELECT 1 FROM chunks c WHERE c.bibcode = e.bibcode
+                  AND c.chunk_index = e.chunk_index AND c.kind = 'boilerplate')
+               RETURNING 1""",
+            [model_id],
+        ).fetchall()
+        if demoted:
+            print(f'Deleted {len(demoted)} embeddings of chunks now tagged boilerplate')
 
         eligible = con.execute(
-            "SELECT count(*) FROM chunks WHERE ? OR kind <> 'boilerplate'",
-            [include_boilerplate],
+            "SELECT count(*) FROM chunks WHERE kind <> 'boilerplate'"
         ).fetchone()[0]
         have = con.execute(
             'SELECT count(*) FROM chunk_embeddings WHERE model = ?', [model_id]
         ).fetchone()[0]
+        # Only a rough size for the progress line: equal counts do not mean up to date
+        # (a changed prefix or re-chunked text leaves every chunk with a stale vector).
         est_pending = max(eligible - have, 0)
         target = min(est_pending, limit) if limit else est_pending
         print(
-            f'{model_id}: {have}/{eligible} chunks already embedded; ~{est_pending} pending'
+            f'{model_id}: {have}/{eligible} chunks have a vector'
+            + (f'; ~{est_pending} pending' if est_pending else '')
             + (f', stopping after {limit}' if limit else '')
         )
-        if not target:
+
+        # Scan with just the tokenizer first, so a run with nothing to do never loads the model.
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        pending = _pending(con, model_id, tokenizer)
+        first = next(pending, None)
+        if first is None:
+            print('Nothing pending: every vector matches its chunk text')
             return
 
-        net, tokenizer = load_embedder()
+        net, _ = load_embedder()
+        pending = itertools.chain([first], pending)
 
         n_done = n_tokens = n_truncated = 0
         t0 = time.perf_counter()
@@ -350,13 +427,15 @@ def embed(limit: int | None = None, include_boilerplate: bool = False) -> None:
             window, window_est = [], 0
             mx.clear_cache()
             dt = time.perf_counter() - t0
-            eta_h = (target - n_done) / (n_done / dt) / 3600
-            print(
-                f'  {n_done}/{target} chunks | {n_tokens / dt:.0f} tok/s | ETA {eta_h:.1f} h',
-                flush=True,
+            progress = f'{n_done}/{target}' if target > n_done else f'{n_done}'
+            eta = (
+                f' | ETA {(target - n_done) / (n_done / dt) / 3600:.1f} h'
+                if target > n_done
+                else ''
             )
+            print(f'  {progress} chunks | {n_tokens / dt:.0f} tok/s{eta}', flush=True)
 
-        for item in _pending(con, model_id, tokenizer, include_boilerplate):
+        for item in pending:
             if limit and n_done + len(window) >= limit:
                 break
             window.append(item)
@@ -386,10 +465,10 @@ if __name__ == '__main__':
         '--limit', type=int, default=None, help='Stop after embedding N pending chunks'
     )
     parser.add_argument(
-        '--include-boilerplate',
+        '--dry-run',
         action='store_true',
-        help="Also embed kind='boilerplate' chunks",
+        help='Find what is pending and estimate the time, embed nothing',
     )
     args = parser.parse_args()
 
-    embed(limit=args.limit, include_boilerplate=args.include_boilerplate)
+    embed(limit=args.limit, dry_run=args.dry_run)
