@@ -199,6 +199,35 @@ A file that converts to almost no text (under 500 characters), makes MinerU time
 
 Later runs skip the files on that list, so a PDF that always times out doesn't cost 30 minutes every time. Naming a file on the command line converts it anyway and never records anything, and `--retry-failed` retries the whole list. Other errors, such as a disk problem, are only printed and are tried again on the next run. The list is gitignored like the rest of `data/`, so back it up with the database. Unlike `fetch_ignore.txt`, it holds filenames with their extension.
 
+## Stage 4: chunk
+
+`chunk` splits each paper's Markdown into passage-sized pieces, and the later stages work on those pieces. Search returns chunks, so their size sets how precise an answer can be. It reads `data/markdown/` and the `papers` table, and writes the `chunks` table. It needs no GPU and is quick: a few minutes for about 11,000 papers. The first run downloads the embedding model's tokenizer, a small download with no model weights, because chunk sizes are counted in the same tokens the embedding model uses.
+
+**How it splits.** It follows each paper's headings and packs the paragraphs of a section into chunks of up to 1,024 tokens. It cuts only between paragraphs, with no overlap between neighbouring chunks. A paragraph that is too long is split at line breaks, then at bullet points, then at sentences. Each chunk records its heading and the full path of headings above it, for example `2 Method > 2.3 Raman Scattering`, so a generic heading like "Simulation" keeps its parent's context. The embed stage puts the paper title and this path in front of the text.
+
+Every chunk has a `kind`:
+
+| Kind | What it is |
+| --- | --- |
+| `prose` | Ordinary text. |
+| `table` | One whole table with its caption. It is stored in full, but only the caption and header row are embedded. |
+| `boilerplate` | Acknowledgements, data availability, funding, author contributions, conflict-of-interest statements, and reference lists or author lists that leaked into the text. It stays searchable with `grep`, but it is not embedded by default. |
+
+### What gets stored
+
+The `chunks` table has one row per chunk: `bibcode`, `arxiv_id`, `chunk_index` (the order within the paper), `section_heading`, `heading_path`, `kind`, `text` and `n_tokens`. A paper comes to about 30 chunks, and in the corpus this was developed on about 90% of them are prose.
+
+```
+pixi run chunk --dry-run                 # how many papers would be chunked, without writing anything
+pixi run chunk --limit 5                 # chunk the first 5 pending papers, as a smoke test
+pixi run chunk                           # every paper that has Markdown and no chunks yet
+pixi run chunk --rebuild                 # drop the chunks table and chunk every paper again
+```
+
+- **Resumable:** a paper that already has chunks is skipped, and a paper without Markdown yet waits for `fetch` and `convert`. A paper that gains an arXiv ID through `fetch --refresh` is re-chunked from its new Markdown automatically.
+- **Changing the chunk size:** edit `MAX_CHUNK_TOKENS` in `config.py`, run `chunk --rebuild`, and then run `embed` straight away. Vectors are stored apart from the chunks, together with a hash of the text they came from. So `--rebuild` keeps the vector of every chunk whose text did not change and only the changed chunks are embedded again. Until `embed` has run, search can return a changed chunk with the vector of its old text.
+- **Re-converted papers:** a paper is chunked once. If you convert it again and get new Markdown, `chunk` does not notice, so use `--rebuild`.
+
 ## Browsing the database
 
 `browse` opens a [marimo](https://marimo.io) notebook in your browser, with the corpus attached read-only so nothing you do there can change it:

@@ -22,7 +22,7 @@ pixi run fetch --refresh [--since YEAR] [--dry-run]  # first re-query ADS for pa
 pixi run canonicalize [--apply] [--since YEAR]   # one row per paper under ADS's canonical bibcode: dry run by default (looks up every paper on ADS, ~2 min)
 pixi run convert [--limit N] [--dry-run]         # convert data/html + data/pdf into data/markdown (own `convert` env, formerly `extract`); --dry-run counts what is waiting; ends with a converted/failed summary
 pixi run convert 1965ApJS....9..321M.pdf         # convert specific file(s), bypassing convert_ignore.txt
-pixi run chunk [--limit N] [--rebuild]           # split data/markdown into the `chunks` table (--rebuild drops it and redoes every paper)
+pixi run chunk [--limit N] [--rebuild] [--dry-run]  # split data/markdown into the `chunks` table (--rebuild drops it and redoes every paper, keeping vectors whose text is unchanged; --dry-run counts pending/stale/waiting papers read-only); ends with a papers/chunks-per-kind summary
 pixi run -e embed embed [--limit N]       # embed pending chunks into `chunk_embeddings` with config.EMBED_MODEL (resumable; Ctrl-C loses ≤ one ~250K-token window)
 pixi run browse                                  # marimo notebook (notebooks/browse.py, own `browse` env) to page through every table and run SQL, corpus attached read-only
 bin/arxivrag-search {search|chunk|paper|grep|status} ...  # read-only literature search CLI (see "Search" below); also `pixi run search ...`

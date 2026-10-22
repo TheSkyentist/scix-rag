@@ -33,26 +33,38 @@ to flatten lists into one "•"-joined line), then at sentence boundaries, and
 the pieces are re-packed up to the budget. A single sentence that alone
 exceeds the budget still becomes its own oversized chunk.
 
-Token counts use the embedding model's own tokenizer (config.EMBED_MODEL;
-harrier-oss-v1 ships the Qwen3 tokenizer), not a proxy -- loading just the
-tokenizer needs no GPU and no model weights.
+Token counts use the embedding model's own tokenizer (config.EMBED_MODEL), not
+a proxy -- loading just the tokenizer needs no GPU and no model weights.
 
-A paper is skipped if it already has any rows in `chunks`. Re-chunking after
-a logic change means `--rebuild`, which drops the whole table first (and so
-any embeddings stored in it once the embed stage exists).
+A paper is skipped if it already has any rows in `chunks`, except one that
+gained an arxiv_id since it was chunked (its stem and source text changed),
+which is re-chunked once the new Markdown exists. A paper whose Markdown was
+converted again is NOT noticed: use `--rebuild`, which drops the `chunks` table
+and chunks every paper. Embeddings live in their own table (embed.py), keyed by
+(bibcode, chunk_index, model) with a hash of the embedded text, so a rebuild
+keeps every vector whose chunk text is unchanged; run `embed` right after to
+refresh the rest.
 
 Run directly (from the `chunk` environment):
     pixi run chunk
+    pixi run chunk --dry-run   # count what is pending, write nothing
     pixi run chunk --limit 5   # smoke-test on a handful first
     pixi run chunk --rebuild   # drop `chunks` and re-chunk everything
 """
 
 from __future__ import annotations
 
+import os
 import re
+from collections import Counter
 from typing import Callable, NamedTuple
 
 import duckdb
+
+# Only the tokenizer is used here; without this transformers warns on every run
+# that PyTorch is missing.
+os.environ.setdefault('TRANSFORMERS_NO_ADVISORY_WARNINGS', '1')
+
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 import config
@@ -341,7 +353,76 @@ def table_embed_text(
     return tokenizer.decode(ids)
 
 
-def chunk(limit: int | None = None, rebuild: bool = False) -> None:
+def _plan(
+    con: duckdb.DuckDBPyConnection, rebuild: bool = False
+) -> tuple[list[tuple[str, str | None]], set[str], int, int]:
+    """(papers to chunk, the stale ones among them, n already chunked, n waiting on Markdown).
+    rebuild=True plans as if the chunks table were empty (used by --dry-run --rebuild)."""
+    already_chunked: set[str] = set()
+    stale: set[str] = set()
+    if not rebuild:
+        try:
+            already_chunked = {
+                r[0]
+                for r in con.execute('SELECT DISTINCT bibcode FROM chunks').fetchall()
+            }
+            # A paper that gained an arxiv_id after being chunked (fetch --refresh) now has a
+            # different stem and source text; its old chunks are replaced once the new Markdown
+            # exists.
+            stale = {
+                r[0]
+                for r in con.execute(
+                    """SELECT DISTINCT c.bibcode FROM chunks c JOIN papers p USING (bibcode)
+                       WHERE c.arxiv_id IS DISTINCT FROM p.arxiv_id"""
+                ).fetchall()
+            }
+        except duckdb.CatalogException:  # no chunks table yet
+            pass
+
+    todo: list[tuple[str, str | None]] = []
+    n_done = n_waiting = 0
+    for bibcode, arxiv_id in con.execute(
+        'SELECT bibcode, arxiv_id FROM papers'
+    ).fetchall():
+        if bibcode in already_chunked and bibcode not in stale:
+            n_done += 1
+        elif (config.MARKDOWN_DIR / f'{arxiv_id or bibcode}.md').exists():
+            todo.append((bibcode, arxiv_id))
+        else:
+            n_waiting += 1
+    return todo, stale, n_done, n_waiting
+
+
+def _dry_run(limit: int | None, rebuild: bool) -> None:
+    """Report what a run would do. Read-only: nothing is created, dropped or written."""
+    if not config.DB_PATH.exists():
+        raise SystemExit(f'No database at {config.DB_PATH}; run `pixi run query` first')
+    con = duckdb.connect(str(config.DB_PATH), read_only=True)
+    todo, stale, n_done, n_waiting = _plan(con, rebuild)
+    con.close()
+
+    n_run = min(limit, len(todo)) if limit else len(todo)
+    print('Dry run, nothing written.')
+    print(
+        f'  {len(todo):,} papers would be chunked'
+        + (' (all of them again, --rebuild)' if rebuild else '')
+        + (f', the first {n_run:,} (--limit)' if n_run < len(todo) else '')
+    )
+    if stale:
+        print(
+            f'  {len(stale):,} of them are re-chunked because they gained an arXiv ID'
+        )
+    print(f'  {n_done:,} papers already have chunks')
+    print(f'  {n_waiting:,} papers have no Markdown yet (waiting on fetch or convert)')
+
+
+def chunk(
+    limit: int | None = None, rebuild: bool = False, dry_run: bool = False
+) -> None:
+    if dry_run:
+        _dry_run(limit, rebuild)
+        return
+
     con = duckdb.connect(str(config.DB_PATH))
     if rebuild:
         con.execute('DROP TABLE IF EXISTS chunks')
@@ -353,30 +434,14 @@ def chunk(limit: int | None = None, rebuild: bool = False) -> None:
             're-run with --rebuild to drop it and re-chunk everything'
         )
 
-    already_chunked = {
-        r[0] for r in con.execute('SELECT DISTINCT bibcode FROM chunks').fetchall()
-    }
-    # A paper that gained an arxiv_id after being chunked (fetch --refresh) now has a different
-    # stem and source text; its old chunks are replaced once the new Markdown exists.
-    stale = {
-        r[0]
-        for r in con.execute(
-            """SELECT DISTINCT c.bibcode FROM chunks c JOIN papers p USING (bibcode)
-               WHERE c.arxiv_id IS DISTINCT FROM p.arxiv_id"""
-        ).fetchall()
-    }
-    all_papers = con.execute('SELECT bibcode, arxiv_id FROM papers').fetchall()
-    todo = [
-        (bibcode, arxiv_id)
-        for bibcode, arxiv_id in all_papers
-        if (bibcode not in already_chunked or bibcode in stale)
-        and (config.MARKDOWN_DIR / f'{arxiv_id or bibcode}.md').exists()
-    ]
+    todo, stale, _, _ = _plan(con)
     if limit:
         todo = todo[:limit]
     print(f'Chunking {len(todo)} papers')
 
-    tokenizer = AutoTokenizer.from_pretrained(_TOKENIZER_NAME)
+    kinds: Counter[str] = Counter()
+    if todo:
+        tokenizer = AutoTokenizer.from_pretrained(_TOKENIZER_NAME)
 
     for bibcode, arxiv_id in todo:
         stem = arxiv_id or bibcode
@@ -398,10 +463,16 @@ def chunk(limit: int | None = None, rebuild: bool = False) -> None:
             for i, c in enumerate(packed)
         ]
         con.executemany(_INSERT_CHUNK, rows)
+        kinds.update(c.kind for c in packed)
         print(f'  [ok] {stem}: {len(rows)} chunks')
 
     con.commit()
     con.close()
+    by_kind = ', '.join(f'{n:,} {k}' for k, n in sorted(kinds.items()))
+    print(
+        f'\nDone. {len(todo)} papers chunked into {sum(kinds.values()):,} chunks'
+        + (f' ({by_kind})' if by_kind else '')
+    )
 
 
 if __name__ == '__main__':
@@ -421,6 +492,11 @@ if __name__ == '__main__':
         action='store_true',
         help='Drop the chunks table and re-chunk every paper',
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Count what is pending (with --rebuild: everything), write nothing',
+    )
     args = parser.parse_args()
 
-    chunk(limit=args.limit, rebuild=args.rebuild)
+    chunk(limit=args.limit, rebuild=args.rebuild, dry_run=args.dry_run)
