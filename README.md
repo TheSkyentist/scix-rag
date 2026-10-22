@@ -86,6 +86,15 @@ pixi run query --query 'abs:"Little Red Dots"' --references --citations --dry-ru
 
 The request count includes the [clean-up pass](#keeping-one-row-per-paper) at the end. The numbers above are illustrative.
 
+### What gets stored
+
+`query` creates the database `data/papers.duckdb` on its first run, with two tables. Later stages add two more.
+
+- **`papers`**: one row per paper, keyed on its bibcode. It holds the title, authors, abstract, year, journal, DOI, keywords, citation count, and the arXiv ID when ADS knows one. A `query_source` column records how the paper entered the corpus: `seed`, `search:<query>`, `reference_of:<bibcode>` or `citation_of:<bibcode>`. The first entry is kept when a later query finds the same paper. `fetch` adds an `esources` column listing which full-text sources ADS has for the paper.
+- **`citation_edges`**: one row per citation, as a (citing bibcode, cited bibcode) pair. Only the links between a seed and its neighbors are stored.
+
+Like the rest of `data/`, the database is gitignored, so back it up yourself.
+
 ### Other options
 
 | Option | Effect |
@@ -115,7 +124,6 @@ It costs one ADS lookup for every paper in the database, in batches of 75, so ab
 ### Good to know
 
 - Re-running is cheap and safe. Seeds already in the database are refreshed, only new neighbors cost an ADS request, and you can add as many different queries as you like to one corpus.
-- Each paper records how it got in (`query_source`): as a seed, or as a reference or citation of one. The first entry is kept when a later query finds the same paper.
 - ADS allows about 5000 requests per day per key. A large expansion uses a few hundred. If you hit the limit, the run stops with a message and you can re-run it the next day.
 
 ## Stage 2: fetch
