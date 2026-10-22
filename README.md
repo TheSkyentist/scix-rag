@@ -84,14 +84,33 @@ pixi run query --query 'abs:"Little Red Dots"' --references --citations --dry-ru
 #   about 220 ADS requests
 ```
 
-The request count includes the clean-up pass at the end (see `--no-canonicalize` below). The numbers above are illustrative.
+The request count includes the [clean-up pass](#keeping-one-row-per-paper) at the end. The numbers above are illustrative.
 
 ### Other options
 
 | Option | Effect |
 | --- | --- |
 | `--max-seeds N` | Most seeds a `--query` may use (default 2000). A warning says how many matches were left out. |
-| `--no-canonicalize` | Skip the clean-up pass at the end that merges papers ADS has re-keyed, such as a preprint later published under a new bibcode. |
+| `--no-canonicalize` | Skip the clean-up pass at the end that merges papers ADS has re-keyed (see [below](#keeping-one-row-per-paper)). |
+
+### Keeping one row per paper
+
+ADS changes its records over time. Usually a paper first appears as an arXiv preprint (`2026arXiv260104955C`). When it is published, ADS re-keys it to the journal record (`2026Natur.657..621C`) and the old bibcode turns into an alias. Less often, a journal record gains an arXiv ID after the fact. Left alone, the database would end up with two rows for one paper, or with a stale arXiv ID. The `canonicalize` step fixes this. It looks every paper up on ADS, groups the rows that are the same paper, and keeps one row under ADS's canonical bibcode. When it merges rows it also:
+
+- repoints the citation links to the surviving row
+- keeps one copy of the paper's chunks and embeddings, without re-embedding
+- moves or deletes raw files stored under the old name
+- fixes the fetch and convert ignore lists, so a paper that gained an arXiv ID is retried from arXiv
+
+Every `query` run ends with it unless you pass `--no-canonicalize`, and `fetch --refresh` runs it for papers that still have no arXiv ID. You can also run it on its own:
+
+```
+pixi run canonicalize                    # dry run: print what would change
+pixi run canonicalize --apply            # write the changes
+pixi run canonicalize --since 2015 --apply   # only look up papers from 2015 on
+```
+
+It costs one ADS lookup for every paper in the database, in batches of 75, so about 150 requests for 11,000 papers. That cost is part of every `query` run. It only merges rows that ADS itself links, through an alias or a shared arXiv ID. A preprint and a journal record that ADS has not linked stay as two rows, and there are a few dozen of these in the corpus this was developed on.
 
 ### Good to know
 
@@ -133,7 +152,7 @@ Later runs skip every paper on that list, so the same dead ends aren't retried e
 
 ### Refreshing arXiv links
 
-A paper that was only a journal record when you ran `query` often gets linked to its arXiv preprint later. `--refresh` asks ADS again about the papers that have no arXiv ID, and updates those that gained one, so they are fetched from arXiv's HTML instead of a PDF. Papers ADS has re-keyed are merged into one row, the same clean-up `query` ends with. `--since YEAR` limits the refresh to recent papers, and `--dry-run` reports what would change without writing anything.
+Most papers have an arXiv ID from the start. Some journal records, though, are not yet linked to their preprint when you run `query`, and ADS may add the link later. `--refresh` asks ADS again about the papers that have no arXiv ID, and updates those that gained one, so they are fetched from arXiv's HTML instead of a PDF. Papers ADS has re-keyed are merged into one row, the same [clean-up](#keeping-one-row-per-paper) `query` ends with. `--since YEAR` limits the refresh to recent papers, and `--dry-run` reports what would change without writing anything.
 
 ### Good to know
 
