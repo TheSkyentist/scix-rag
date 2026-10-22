@@ -5,7 +5,7 @@ description: Search a local full-text index of ~10,800 astro-ph papers (Little R
 
 # arxivrag-search: local astro-ph literature search
 
-A local index of about 334K passages from about 10.8K papers (full text, converted to Markdown, split into chunks, embedded with Qwen3-Embedding-0.6B). There is no LLM and no network access involved: you do the reading and writing.
+A local index of about 334K passages from about 10.8K papers (full text, converted to Markdown, split into chunks, embedded with Microsoft's harrier-oss-v1-0.6b). There is no LLM and no network access involved: you do the reading and writing.
 
 Command (works from any directory):
 
@@ -20,15 +20,16 @@ Command (works from any directory):
 It does three things in one call (model loads once, ~3 s; the regex scan adds ~2 s):
 
 1. **Semantic search** over all passages with your 1-4 phrasings, fused by reciprocal rank.
-2. **Literal search**: if you pass `--term`, the same ranking is *also* computed over only the passages that match the regex, and the two are fused. A passage that is both on-topic and contains the term rises to the top, even when it is a long passage that mentions the term in one sentence.
-3. **Coverage**: after the passages, every *other* paper matching the term is listed (one line each, ordered by number of matching passages), so "which papers mention X?" is answered by the same call.
+2. **Literal search**: if you pass `--term`, the same ranking is *also* computed over only the passages that match the regex, and the two are fused, so on-topic passages that contain the term are nudged up. With the current embedding model the semantic ranking usually has them near the top already, so expect this to reorder the passages only a little.
+3. **Coverage**: after the passages, every *other* paper matching the term is listed (one line each, ordered by number of matching passages), so "which papers mention X?" is answered by the same call. This list, and the highlighted matches below, are the main reasons to pass `--term`.
 
 Passages that match the term show the match in context with the match in **bold** (windows separated by `[…]`), so the relevant sentence is not clipped away.
 
 ### When to pass `--term`
 
-- **Yes**, whenever the question names something specific: a spectral line or feature (`Ca II triplet`, `O I 8446`, `[Fe II]`), an object (`The Egg`, `GN-28074`, `UNCOVER-45924`), an instrument mode, an acronym, a number or unit, a formula.
-- **No**, for purely conceptual questions ("what explains the V-shaped continuum?"). Plain semantic search is then the right tool and the call is unchanged.
+- **Yes**, when you need completeness or exact mentions of something specific: "which papers detect / discuss / use X", a spectral line or feature (`Ca II triplet`, `O I 8446`, `[Fe II]`), an object (`The Egg`, `GN-28074`, `UNCOVER-45924`), an instrument mode, an acronym, a number or unit, a formula. It costs ~2 s.
+- **No**, for conceptual questions ("what explains the V-shaped continuum?", "how could electron scattering broaden the lines?"). Semantic search handles these well on its own.
+- **Not as a fix for weak results.** If the passages are off-topic, rephrase the query; if you need every mention, use `grep`.
 
 ### Writing the regex
 
@@ -66,7 +67,7 @@ Rules of thumb: allow `\W*` between words (spaces, hyphens, LaTeX braces), use `
 
 ## How to use it well
 
-1. Decide whether the question names a specific thing. If so, plan a `--term`; if not, plain `search`.
+1. Decide whether you need coverage or exact mentions of a named thing. If so, plan a `--term`; if not, plain `search`.
 2. Write 2-3 phrasings of the *same* question: a natural-language question, a terminology variant with synonyms and abbreviations, and a declarative sentence as a paper would state it. Do not put years or authors in the query; use `--since` for a year cutoff.
 3. **Expand before you quote or cite a number.** Previews are clipped (`[+N chars]`) and keyword windows show only part of the passage. Read the whole passage with `chunk` first.
 4. **Judge relevance by content, not by score.** Cosine scores are only a ranking: on-topic hits are typically 0.55-0.8, but generic passages (a title block, a table of measurements) can score above 0.6 on a query that merely mentions the population. Dense search always returns *something*; if the top passages are weak or off-topic, say so instead of stretching them.
@@ -90,6 +91,6 @@ Cite as `First author et al. (year), bibcode`, with `https://ui.adsabs.harvard.e
 
 - `cannot open ... Conflicting lock` / "database locked": a pipeline job (usually `pixi run embed`, which can take hours) holds the database. Tell the user and retry later. Do not try to work around it.
 - `embed environment missing`: tell the user to run `pixi install -e embed` in the arXivRAG repo. Do not run it yourself.
-- `no embeddings for Qwen3-Embedding-0.6B`, or a low-coverage warning: run `status`, report the numbers, and stop.
+- `no embeddings for harrier-oss-v1-0.6b`, or a low-coverage warning: run `status`, report the numbers, and stop.
 - `--term regex rejected`: RE2 syntax error (usually a lookaround or backreference); rewrite with `|`, `\W*`, `\b`.
 - **Never run `embed`, `chunk`, `fetch`, `convert`, `query` or anything else that writes to the database or calls external APIs.** This tool is read-only.
