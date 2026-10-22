@@ -7,8 +7,12 @@ platforms = [{platform = "osx-arm64", macos = "14.5"}]
 
 [dependencies]
 python = ">=3.14.8,<3.15"
-duckdb = ">=1.5.6,<2"
 python-dotenv = ">=1.2.4,<2"
+
+# DuckDB 2.0 (Oct 2026) is not on conda-forge yet (latest there: 1.5.6), so it comes from PyPI.
+# Move it back to [dependencies] once the conda-forge feedstock catches up.
+[pypi-dependencies]
+duckdb = ">=2.0.0,<3"
 
 [feature.query.dependencies]
 httpx = ">=0.28.1,<0.29"
@@ -38,14 +42,14 @@ opencv-python-headless = ">=5.0.0.93, <6"
 convert = "python -m src.convert"
 
 [feature.chunk.dependencies]
-transformers = ">=5.19.0,<6"
+transformers = ">=5.20.2,<6"
 
 [feature.chunk.tasks]
 chunk = "python -m src.chunk"
 
 [feature.embed.dependencies]
-mlx = ">=0.32.0,<0.33"
-mlx-lm = ">=0.32.0,<0.33"
+mlx = ">=0.32.4,<0.33"
+mlx-lm = ">=0.32.2,<0.33"
 
 [feature.embed.tasks]
 embed = "python -m src.embed"
