@@ -356,6 +356,19 @@ pixi run browse
 - **Write lock:** like `search`, it can't open the database while `embed` or `chunk` is running.
 - **It's a plain Python file:** `notebooks/browse.py` is yours to edit or extend.
 
+### Map of the corpus
+
+`map` opens a second notebook (same `browse` environment) that draws every embedded paper as a point, placed by similarity, so topics form islands:
+
+```
+pixi run map
+```
+
+- **Position:** a paper's vector is the mean of its chunk embeddings, projected to 2D with UMAP. The first run takes about a minute; the result is cached in `data/paper_map.npz` and rebuilt only when `embed` has added vectors.
+- **Islands:** density clustering on the 2D layout, each island named by its most distinctive title and keyword terms. The shaded "land" is the paper density.
+- **Controls:** colour by year, citations, island or arXiv class; a *Papers up to* year slider to watch the islands grow; *Citations* draws either island-to-island flows (line width = number of citations) or every citation line; *Focus paper* highlights one paper's references and citations.
+- **Selecting:** scroll to zoom, drag to pan, hover for the paper. Lasso or box select (the toolbar) lists the papers below; picking one row shows its references and citations within the corpus.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).

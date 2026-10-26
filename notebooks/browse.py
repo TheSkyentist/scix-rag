@@ -1,7 +1,7 @@
 import marimo
 
-__generated_with = '0.25.1'
-app = marimo.App(width='full')
+__generated_with = "0.25.1"
+app = marimo.App(width="full")
 
 
 @app.cell(hide_code=True)
@@ -105,10 +105,10 @@ def _(con, mo):
         ORDER BY citation_count DESC NULLS LAST
         LIMIT 100
         """,
-        engine=con,
+        engine=con
     )
     return
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run()

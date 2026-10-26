@@ -1,6 +1,6 @@
 [workspace]
 name = "scix-rag"
-version = "1.0.1"
+version = "1.1.0"
 description = "Local astronomical paper RAG pipeline (ADS/SciX corpus, self-hosted embedding + retrieval)"
 channels = ["conda-forge"]
 platforms = [{ platform = "osx-arm64", macos = "14.5" }]
@@ -56,11 +56,21 @@ search = "python -m src.search"
 
 [feature.browse.tasks]
 browse = "marimo edit notebooks/browse.py"
+map = "marimo edit notebooks/map.py"
+
+# The map notebook sends every paper to the browser (about 3 MB of figure); marimo's
+# default output cap is 8 MB, which leaves little headroom once the page escapes it.
+[feature.browse.activation.env]
+MARIMO_OUTPUT_MAX_BYTES = "50000000"
 
 [feature.browse.dependencies]
 marimo = ">=0.25.1,<0.26"
 polars = ">=2.0.0,<3"
 pyarrow = ">=25.0.0,<26"
+numpy = ">=2.5.4,<3"
+scikit-learn = ">=1.9.1,<2"
+umap-learn = ">=0.5.12,<0.6"
+plotly = ">=7.1.0,<8"
 
 # Process everything `query` has added to the corpus: every stage after `query`, in order.
 [tasks]

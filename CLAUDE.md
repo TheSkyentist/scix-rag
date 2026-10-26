@@ -24,6 +24,7 @@ pixi run convert 1965ApJS....9..321M.pdf         # convert specific file(s), byp
 pixi run chunk [--limit N] [--rebuild] [--dry-run]  # split data/markdown into the `chunks` table (--rebuild drops it and redoes every paper, keeping vectors whose text is unchanged; --dry-run counts pending/stale/waiting papers read-only); ends with a papers/chunks-per-kind summary
 pixi run -e embed embed [--limit N] [--dry-run]  # embed pending chunks into `chunk_embeddings` with config.EMBED_MODEL (resumable; Ctrl-C loses ≤ one ~250K-token window); pending = hash mismatch, never a count comparison; --dry-run is read-only, loads no model, estimates time at 3,500 tok/s
 pixi run browse                                  # marimo notebook (notebooks/browse.py, own `browse` env) to page through every table and run SQL, corpus attached read-only
+pixi run map                                     # marimo notebook (notebooks/map.py, same `browse` env): 2D UMAP map of papers (mean chunk vector) with islands, year slider, citation flows; data prep in src/paper_map.py, cached in data/paper_map.npz
 bin/scix-search {search|chunk|paper|status} ...  # read-only literature search CLI (see "Search" below); also `pixi run search ...`
 ```
 
