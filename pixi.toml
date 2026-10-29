@@ -1,6 +1,6 @@
 [workspace]
 name = "scix-rag"
-version = "1.1.0"
+version = "1.2.0"
 description = "Local astronomical paper RAG pipeline (ADS/SciX corpus, self-hosted embedding + retrieval)"
 channels = ["conda-forge"]
 platforms = [{ platform = "osx-arm64", macos = "14.5" }]
@@ -8,6 +8,11 @@ platforms = [{ platform = "osx-arm64", macos = "14.5" }]
 [dependencies]
 python = ">=3.14.8,<3.15"
 python-dotenv = ">=1.2.4,<2"
+
+# DuckDB is its own feature so `convert` (no database access) can skip it: the conda-forge
+# python-duckdb pulls in a conda numpy, whose OpenBLAS links llvm-openmp and clashes with the
+# libomp bundled in the torch wheel (OMP Error #15, mineru-kit aborts).
+[feature.db.dependencies]
 duckdb = ">=2.0.0,<3"
 
 [feature.query.dependencies]
@@ -78,9 +83,9 @@ update = { description = "fetch -> convert -> chunk -> embed", depends-on = [
 ] }
 
 [environments]
-query = { features = ["query"] }
-fetch = { features = ["fetch"] }
+query = { features = ["query", "db"] }
+fetch = { features = ["fetch", "db"] }
 convert = { features = ["convert"] }
-chunk = { features = ["chunk"] }
-embed = { features = ["embed"] }
-browse = { features = ["browse"] }
+chunk = { features = ["chunk", "db"] }
+embed = { features = ["embed", "db"] }
+browse = { features = ["browse", "db"] }
