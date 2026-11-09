@@ -40,6 +40,7 @@ import hashlib
 import itertools
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Iterator, NamedTuple
@@ -54,6 +55,7 @@ from mlx_lm.models.qwen3 import Model, ModelArgs
 # that PyTorch is missing.
 os.environ.setdefault('TRANSFORMERS_NO_ADVISORY_WARNINGS', '1')
 
+from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 import config
@@ -403,12 +405,21 @@ def embed(limit: int | None = None, dry_run: bool = False) -> None:
         t0 = time.perf_counter()
         window: list[tuple[str, int, str, str]] = []
         window_est = 0
+        bar = tqdm(total=target or None, unit='chunk', dynamic_ncols=True, smoothing=0.1)
+        stop_tick = threading.Event()
+
+        def _tick() -> None:  # windows take ~1 min; keep the elapsed clock moving between them
+            while not stop_tick.wait(1.0):
+                bar.refresh()
+
+        threading.Thread(target=_tick, daemon=True).start()
 
         def flush() -> None:
             nonlocal window, window_est, n_done, n_tokens, n_truncated
             if not window:
                 return
-            emb = embed_texts(net, tokenizer, [w[2] for w in window])
+            batch = window
+            emb = embed_texts(net, tokenizer, [w[2] for w in batch])
             con.begin()
             try:
                 _insert_vectors(
@@ -427,13 +438,8 @@ def embed(limit: int | None = None, dry_run: bool = False) -> None:
             window, window_est = [], 0
             mx.clear_cache()
             dt = time.perf_counter() - t0
-            progress = f'{n_done}/{target}' if target > n_done else f'{n_done}'
-            eta = (
-                f' | ETA {(target - n_done) / (n_done / dt) / 3600:.1f} h'
-                if target > n_done
-                else ''
-            )
-            print(f'  {progress} chunks | {n_tokens / dt:.0f} tok/s{eta}', flush=True)
+            bar.set_postfix_str(f'{n_tokens / dt:.0f} tok/s', refresh=False)
+            bar.update(len(batch))
 
         for item in pending:
             if limit and n_done + len(window) >= limit:
@@ -445,6 +451,8 @@ def embed(limit: int | None = None, dry_run: bool = False) -> None:
             if window_est >= config.EMBED_COMMIT_TOKENS:
                 flush()
         flush()
+        stop_tick.set()
+        bar.close()
 
         dt = time.perf_counter() - t0
         print(
