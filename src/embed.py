@@ -1,7 +1,6 @@
 """
 Embed every chunk in `chunks` with config.EMBED_MODEL (a Qwen3-backbone embedder,
-currently harrier-oss-v1-0.6b; run locally with MLX, bf16 -- 8-/4-bit saved memory
-but were slower) and store the vectors in `chunk_embeddings` in papers.duckdb.
+currently harrier-oss-v1-0.6b) and store the vectors in `chunk_embeddings` in papers.duckdb.
 
 Embedded text for a chunk = paper title + heading path (+ blank line) + body,
 where body is the chunk text, or for `kind='table'` just the caption + header
@@ -10,6 +9,12 @@ stay reachable through `search --regex`). Documents get no instruction prefix; q
 stage) use config.QUERY_INSTRUCTION (embed.format_query). The vector is the final
 hidden state of the appended <|endoftext|> token, L2-normalized, so cosine
 similarity is a dot product.
+
+The network runs on one of two backends, picked at import: MLX on Apple Silicon
+(src/embed_mlx.py; bf16 -- 8-/4-bit saved memory but were slower) or PyTorch
+elsewhere (src/embed_torch.py; CUDA in bf16 when available, else CPU in fp32).
+Both give the same vectors up to rounding, so the stored rows don't record the
+backend and a corpus can move between machines.
 
 `chunk_embeddings` is keyed (bibcode, chunk_index, model) and stores a hash of
 the exact embedded text. That is the "done" test: a chunk is pending if it has
@@ -43,13 +48,21 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Iterator, NamedTuple
+from typing import Any, Iterator, NamedTuple
 
 import duckdb
-import mlx.core as mx
 import numpy as np
 from huggingface_hub import snapshot_download
-from mlx_lm.models.qwen3 import Model, ModelArgs
+
+# MLX where it exists (Apple Silicon), PyTorch everywhere else (Linux x86-64).
+# SCIX_EMBED_BACKEND=torch forces PyTorch (needs torch installed, which the Mac env lacks).
+if os.environ.get('SCIX_EMBED_BACKEND', '').lower() == 'torch':
+    from . import embed_torch as _backend
+else:
+    try:
+        from . import embed_mlx as _backend
+    except ImportError:
+        from . import embed_torch as _backend
 
 # Only the tokenizer is used from transformers; without this it warns on every run
 # that PyTorch is missing.
@@ -131,23 +144,10 @@ def _check_supported(path: Path) -> None:
         )
 
 
-def load_embedder(offline_first: bool = False) -> tuple[Model, PreTrainedTokenizerBase]:
+def load_embedder(offline_first: bool = False) -> tuple[Any, PreTrainedTokenizerBase]:
     path = _model_dir(offline_first)
     _check_supported(path)
-    net = Model(ModelArgs.from_dict(json.loads((path / 'config.json').read_text())))
-    weights: dict[str, mx.array] = {}
-    for f in sorted(path.glob('*.safetensors')):
-        weights.update(mx.load(str(f)))
-    # The HF embedding checkpoints omit the "model." key prefix mlx_lm's
-    # causal-LM wrapper expects (it is a plain Qwen3 backbone, no lm_head).
-    net.load_weights(
-        [
-            (k if k.startswith(('model.', 'lm_head')) else f'model.{k}', v)
-            for k, v in weights.items()
-        ]
-    )
-    mx.eval(net.parameters())
-    return net, AutoTokenizer.from_pretrained(str(path))
+    return _backend.load(path), AutoTokenizer.from_pretrained(str(path))
 
 
 def embedded_text(
@@ -189,7 +189,7 @@ def _batches(order: list[int], ids: list[list[int]]) -> Iterator[list[int]]:
 
 
 def embed_texts(
-    model: Model, tokenizer: PreTrainedTokenizerBase, texts: list[str]
+    model: Any, tokenizer: PreTrainedTokenizerBase, texts: list[str]
 ) -> Embedded:
     eot = tokenizer.convert_tokens_to_ids(_EOT)
     cap = config.MAX_EMBED_TOKENS - 1
@@ -201,15 +201,9 @@ def embed_texts(
     out: list[np.ndarray | None] = [None] * len(ids)
     for batch in _batches(order, ids):
         longest = max(len(ids[i]) for i in batch)
-        arr = mx.array([ids[i] + [eot] * (longest - len(ids[i])) for i in batch])
-        hidden = model.model(
-            arr
-        )  # causal, so right-padding can't affect earlier positions
-        last = mx.array([len(ids[i]) - 1 for i in batch])
-        v = hidden[mx.arange(len(batch)), last].astype(mx.float32)
-        v = v / mx.linalg.norm(v, axis=-1, keepdims=True)
-        mx.eval(v)
-        v = np.array(v)
+        rows = [ids[i] + [eot] * (longest - len(ids[i])) for i in batch]
+        # causal, so right-padding can't affect earlier positions
+        v = _backend.last_token_vectors(model, rows, [len(ids[i]) - 1 for i in batch])
         for j, i in enumerate(batch):
             out[i] = v[j]
     return Embedded(np.stack(out), sum(map(len, ids)), n_truncated)
@@ -399,16 +393,21 @@ def embed(limit: int | None = None, dry_run: bool = False) -> None:
             return
 
         net, _ = load_embedder()
+        print(f'Backend: {_backend.describe(net)}')
         pending = itertools.chain([first], pending)
 
         n_done = n_tokens = n_truncated = 0
         t0 = time.perf_counter()
         window: list[tuple[str, int, str, str]] = []
         window_est = 0
-        bar = tqdm(total=target or None, unit='chunk', dynamic_ncols=True, smoothing=0.1)
+        bar = tqdm(
+            total=target or None, unit='chunk', dynamic_ncols=True, smoothing=0.1
+        )
         stop_tick = threading.Event()
 
-        def _tick() -> None:  # windows take ~1 min; keep the elapsed clock moving between them
+        def _tick() -> (
+            None
+        ):  # windows take ~1 min; keep the elapsed clock moving between them
             while not stop_tick.wait(1.0):
                 bar.refresh()
 
@@ -436,7 +435,7 @@ def embed(limit: int | None = None, dry_run: bool = False) -> None:
             n_tokens += emb.n_tokens
             n_truncated += emb.n_truncated
             window, window_est = [], 0
-            mx.clear_cache()
+            _backend.clear_cache()
             dt = time.perf_counter() - t0
             bar.set_postfix_str(f'{n_tokens / dt:.0f} tok/s', refresh=False)
             bar.update(len(batch))
@@ -467,7 +466,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Embed chunks (MLX) into chunk_embeddings'
+        description='Embed chunks (MLX or PyTorch) into chunk_embeddings'
     )
     parser.add_argument(
         '--limit', type=int, default=None, help='Stop after embedding N pending chunks'

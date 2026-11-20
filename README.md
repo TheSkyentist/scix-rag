@@ -19,7 +19,10 @@ The pipeline has six stages. Each one resumes where it left off, so you can re-r
 
 ## Requirements
 
-- **An Apple Silicon Mac.** Embedding runs on [MLX](https://github.com/ml-explore/mlx), which only runs on Apple Silicon, and the pixi environment is currently locked to `osx-arm64`. MLX is Apple's array framework for machine learning on its own chips. It runs the embedding model fast on the Mac's GPU, so no separate GPU or server is needed.
+- **An Apple Silicon Mac or an x86-64 Linux machine.** The pixi environments are locked for `osx-arm64` and `linux-64`.
+  - On a Mac, embedding runs on [MLX](https://github.com/ml-explore/mlx), Apple's array framework for its own chips. It runs the embedding model fast on the Mac's GPU, so no separate GPU or server is needed.
+  - On Linux, embedding runs on [PyTorch](https://pytorch.org). It uses an NVIDIA GPU when one is visible (the CUDA 13 wheels need a driver of version 580 or newer) and falls back to the CPU otherwise. The CPU works, but embedding a large corpus on it takes days rather than hours, so use a GPU for the first full run. MinerU in `convert` uses the GPU the same way.
+  - Both backends produce the same vectors up to floating-point rounding, so a database built on one machine can be searched on the other. `embed` prints which backend and device it is using.
 - **[pixi](https://pixi.sh).** It manages every dependency. Each stage has its own environment, so the heavy PDF-conversion dependencies stay out of the lighter stages.
 - **[DuckDB](https://duckdb.org).** It stores the papers, the citation graph, the chunks and the vectors in one local file, and computes vector similarity inside the database. That means there is no separate vector-database server to run.
 - **An ADS API key.** It is free; you can create one in your [ADS/SciX](https://scixplorer.org/user/settings/token) account settings. Copy `.env.example` to `.env` and put the key in it, as described under [Stage 1](#stage-1-query).
@@ -245,7 +248,7 @@ pixi run chunk --rebuild                 # drop the chunks table and chunk every
 
 ## Stage 5: embed
 
-`embed` turns every chunk into a vector, a list of 1,024 numbers that captures what the passage is about. Search compares your question with these vectors, so it finds passages by meaning and not only by matching words. The model runs on your own machine, on the GPU of your Mac through MLX. By default it is Microsoft's [harrier-oss-v1-0.6b](https://huggingface.co/microsoft/harrier-oss-v1-0.6b) (MIT license). The first run downloads its weights, about 1.2 GB.
+`embed` turns every chunk into a vector, a list of 1,024 numbers that captures what the passage is about. Search compares your question with these vectors, so it finds passages by meaning and not only by matching words. The model runs on your own machine: on the GPU of your Mac through MLX, or on Linux through PyTorch, on an NVIDIA GPU if there is one and otherwise on the CPU. By default it is Microsoft's [harrier-oss-v1-0.6b](https://huggingface.co/microsoft/harrier-oss-v1-0.6b) (MIT license). The first run downloads its weights, about 1.2 GB.
 
 **This is slow.** The first embedding of a corpus of about 11,000 papers, 345,000 chunks and 200 million tokens took about 16 hours on the machine this was developed on, at roughly 3,500 tokens per second. Yours will differ. It only has to be done once: after that, adding papers only embeds the new chunks. It is safe to leave running overnight and to stop whenever you want.
 
@@ -261,6 +264,7 @@ pixi run embed --limit 200               # embed the first 200 pending chunks, a
 pixi run embed                           # embed everything that is pending
 ```
 
+- **Device on Linux:** a GPU of the Ampere generation or newer (compute capability 8.0+, e.g. RTX 30xx/40xx, A100) is used in bfloat16; an older GPU (e.g. RTX 20xx, GTX 10xx, V100) and the CPU in float32, because PyTorch's memory-efficient attention has no bfloat16 kernel on older GPUs and would run out of memory on long chunks. If a batch still doesn't fit in GPU memory, it is split and retried automatically, and lowering `EMBED_BATCH_TOKENS` in `config.py` avoids the retries. Set `SCIX_EMBED_DEVICE` (for example `cpu` or `cuda:1`) or `SCIX_EMBED_DTYPE` (`bfloat16`, `float16` or `float32`) to override.
 - **Resumable:** vectors are saved in batches of about 250,000 tokens. Ctrl-C loses at most the batch in progress, and the next run carries on.
 - **Only changes are re-embedded:** a chunk is pending when it has no vector or when the hash of its text has changed. After `chunk --rebuild`, or after switching `EMBED_TITLE_PREFIX` in `config.py`, only the affected chunks are embedded again. Vectors for chunks that no longer exist are deleted at the start of a run.
 - **The database is locked while it runs:** `embed` keeps the database open for writing until it finishes, so `search` and `browse` cannot open it in the meantime. For the first big run, that means search is unavailable for many hours.
